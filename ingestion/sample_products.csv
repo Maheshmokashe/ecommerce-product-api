@@ -1,0 +1,6 @@
+sku,name,category,description,price,stock,source_url
+SKU001,Running Shoes Pro,Footwear,Lightweight running shoes with air cushion sole,2999.00,50,https://example.com/shoes1
+SKU002,Cotton Slim T-Shirt,Apparel,100% cotton slim fit t-shirt available in 5 colors,499.00,200,https://example.com/tshirt1
+SKU003,Leather Bifold Wallet,Accessories,Genuine leather wallet with 6 card slots,1299.00,75,https://example.com/wallet1
+SKU004,Sports Sneakers,Footwear,Casual sports sneakers with memory foam insole,3499.00,30,https://example.com/shoes2
+SKU005,Formal Chinos,Apparel,Slim fit formal chinos for office and casual wear,1199.00,100,https://example.com/chinos1
