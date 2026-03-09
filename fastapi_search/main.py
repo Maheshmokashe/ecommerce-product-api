@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
 import pymysql
 import os
 from dotenv import load_dotenv
@@ -6,6 +7,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = FastAPI(title="Product Search Service")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 def get_connection():
     return pymysql.connect(
