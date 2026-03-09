@@ -20,6 +20,8 @@ class Product(models.Model):
     is_active   = models.BooleanField(default=True)
     created_at  = models.DateTimeField(auto_now_add=True)
     updated_at  = models.DateTimeField(auto_now=True)
+    image_url = models.URLField(max_length=500, blank=True, default='')
+
 
     class Meta:
         indexes = [

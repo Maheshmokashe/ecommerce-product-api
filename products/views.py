@@ -132,6 +132,7 @@ def upload_xml(request):
 
             # URLs
             source_url = product.findtext('ProductURL') or ''
+            image_url = product.findtext('PrimaryImageURL') or ''
 
             # Description — strip HTML
             desc_raw = product.findtext('Description') or ''
@@ -145,6 +146,7 @@ def upload_xml(request):
                 price=price,
                 stock=stock,
                 source_url=source_url,
+                image_url=image_url,
                 is_active=True
             )
             loaded += 1
