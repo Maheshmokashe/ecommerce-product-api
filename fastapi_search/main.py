@@ -8,7 +8,6 @@ load_dotenv()
 
 app = FastAPI(title="Product Search Service")
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
@@ -50,7 +49,7 @@ def search_products(
 
     where = " AND ".join(filters)
     sql = f"""
-        SELECT p.id, p.sku, p.name, p.price, p.stock, c.name AS category
+        SELECT p.id, p.sku, p.name, p.price, p.stock, p.source_url, c.name AS category
         FROM products_product p
         LEFT JOIN products_category c ON p.category_id = c.id
         WHERE {where}
