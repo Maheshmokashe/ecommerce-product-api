@@ -3,13 +3,13 @@ from rest_framework.permissions import IsAuthenticated, IsAdminUser
 from rest_framework.decorators import api_view, permission_classes, parser_classes
 from rest_framework.parsers import MultiPartParser
 from rest_framework.response import Response
-from .models import Product, Category
-from .serializers import ProductSerializer, CategorySerializer
+from .models import Product, Category, Retailer
+from .serializers import ProductSerializer, CategorySerializer, RetailerSerializer
 import xml.etree.ElementTree as ET
 import re
 
 class ProductViewSet(viewsets.ModelViewSet):
-    queryset = Product.objects.filter(is_active=True).select_related('category')
+    queryset = Product.objects.filter(is_active=True).select_related('category', 'retailer')
     serializer_class = ProductSerializer
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['name', 'sku', 'category__name']
@@ -20,12 +20,15 @@ class ProductViewSet(viewsets.ModelViewSet):
             return [IsAdminUser()]
         return [IsAuthenticated()]
 
-
 class CategoryViewSet(viewsets.ModelViewSet):
     queryset = Category.objects.all()
     serializer_class = CategorySerializer
     permission_classes = [IsAuthenticated]
 
+class RetailerViewSet(viewsets.ModelViewSet):
+    queryset = Retailer.objects.filter(is_active=True)
+    serializer_class = RetailerSerializer
+    permission_classes = [IsAuthenticated]
 
 def parse_price(price_str):
     if not price_str:
@@ -36,6 +39,69 @@ def parse_price(price_str):
     except:
         return 0.0
 
+def parse_product(product, retailer_obj):
+    # SKU — from Variant first
+    sku = None
+    variant = product.find('Variant')
+    if variant is not None:
+        sku = variant.findtext('SKU')
+
+    # Fallback to Description
+    if not sku:
+        desc = product.findtext('Description') or ''
+        sku_match = re.search(r'SKU\s+(\S+)', desc)
+        if sku_match:
+            sku = sku_match.group(1)
+
+    # Fallback to ProductId
+    if not sku:
+        sku = product.findtext('ProductId')
+
+    if not sku:
+        return None
+
+    # Name
+    name = product.findtext('n') or product.findtext('Name') or 'Unknown'
+    brand = product.findtext('Brand') or ''
+    if brand:
+        name = f"{name} by {brand}"
+
+    # Category — use second Part (most specific)
+    category_name = 'Uncategorized'
+    first_category = product.find('Category')
+    if first_category is not None:
+        parts = [p.text for p in first_category.findall('Part') if p.text]
+        if len(parts) >= 2:
+            category_name = parts[1]
+        elif parts:
+            category_name = parts[0]
+
+    # Price — from Variant first, fallback to product level
+    price_str = ''
+    if variant is not None:
+        price_str = variant.findtext('Price') or ''
+    if not price_str:
+        price_str = product.findtext('Price') or '0'
+
+    # Stock — use StockIndicator directly
+    stock_indicator = product.findtext('StockIndicator') or 'false'
+    stock = 1 if stock_indicator.lower() == 'true' else 0
+
+    # Description — strip HTML
+    desc_raw = product.findtext('Description') or ''
+    desc_clean = re.sub(r'<[^>]+>', ' ', desc_raw).strip()
+
+    return {
+        'sku': sku,
+        'name': name[:255],
+        'description': desc_clean,
+        'category_name': category_name,
+        'price': parse_price(price_str),
+        'stock': stock,
+        'source_url': product.findtext('ProductURL') or '',
+        'image_url': product.findtext('PrimaryImageURL') or '',
+        'retailer': retailer_obj,
+    }
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
@@ -56,107 +122,62 @@ def upload_xml(request):
     else:
         products = root.findall('Product')
 
+    if not products:
+        return Response({'error': 'No products found in XML'}, status=400)
+
+    # Auto-detect retailer from first product's <Retailer> tag
+    first = products[0]
+    retailer_name = first.findtext('Retailer') or 'Unknown Retailer'
+    slug = re.sub(r'[^a-z0-9]+', '-', retailer_name.lower()).strip('-')
+    retailer_obj, created = Retailer.objects.get_or_create(
+        name=retailer_name,
+        defaults={'slug': slug, 'is_active': True}
+    )
+
     loaded = 0
     skipped = 0
     errors = []
 
     for product in products:
         try:
-            # SKU from Variant first
-            sku = None
-            variant = product.find('Variant')
-            if variant is not None:
-                sku = variant.findtext('SKU')
+            data = parse_product(product, retailer_obj)
 
-            # Fallback to Description
-            if not sku:
-                desc = product.findtext('Description') or ''
-                sku_match = re.search(r'SKU\s+(\S+)', desc)
-                if sku_match:
-                    sku = sku_match.group(1)
-
-            # Fallback to ProductId
-            if not sku:
-                sku = product.findtext('ProductId')
-
-            if not sku:
+            if not data:
                 skipped += 1
                 continue
 
-            # Deduplication
-            if Product.objects.filter(sku=sku).exists():
+            if Product.objects.filter(sku=data['sku']).exists():
                 skipped += 1
                 continue
 
-            # Name — tag is <n> in Westside XML
-            name = product.findtext('n') or ''
-            if not name:
-                name = product.findtext('Name') or 'Unknown'
-
-            # Brand
-            brand = product.findtext('Brand') or ''
-            if brand:
-                name = f"{name} by {brand}"
-
-            # Category
-            category_name = 'Uncategorized'
-            first_category = product.find('Category')
-            if first_category is not None:
-                parts = [p.text for p in first_category.findall('Part') if p.text]
-                if len(parts) >= 2:
-                    category_name = parts[1]
-                elif parts:
-                    category_name = parts[0]
-
-            slug = category_name.lower().replace(' ', '-').replace('/', '-').replace('&', 'and')
+            cat_slug = data['category_name'].lower().replace(' ', '-').replace('/', '-').replace('&', 'and')
             category, _ = Category.objects.get_or_create(
-                name=category_name,
-                defaults={'slug': slug}
+                name=data['category_name'],
+                defaults={'slug': cat_slug}
             )
 
-            # Price
-            price_str = ''
-            if variant is not None:
-                price_str = variant.findtext('Price') or ''
-            if not price_str:
-                price_str = product.findtext('Price') or '0'
-            price = parse_price(price_str)
-
-            # Stock
-            available = ''
-            if variant is not None:
-                available = variant.findtext('Available') or ''
-            if not available:
-                available = product.findtext('StockIndicator') or 'false'
-            stock = 100 if available.lower() == 'true' else 0
-
-            # URLs
-            source_url = product.findtext('ProductURL') or ''
-            image_url = product.findtext('PrimaryImageURL') or ''
-
-            # Description — strip HTML
-            desc_raw = product.findtext('Description') or ''
-            desc_clean = re.sub(r'<[^>]+>', ' ', desc_raw).strip()
-
             Product.objects.create(
-                sku=sku,
-                name=name[:255],
-                description=desc_clean,
+                sku=data['sku'],
+                name=data['name'],
+                description=data['description'],
                 category=category,
-                price=price,
-                stock=stock,
-                source_url=source_url,
-                image_url=image_url,
+                retailer=data['retailer'],
+                price=data['price'],
+                stock=data['stock'],
+                source_url=data['source_url'],
+                image_url=data['image_url'],
                 is_active=True
             )
             loaded += 1
 
         except Exception as e:
-            errors.append(f"SKU {sku}: {str(e)}")
+            errors.append(str(e))
             skipped += 1
 
     return Response({
-        'message': f'Done! Loaded: {loaded} | Skipped: {skipped}',
+        'message': f'Done! Retailer: {retailer_name} | Loaded: {loaded} | Skipped: {skipped}',
+        'retailer': retailer_name,
+        'retailer_created': created,
         'loaded': loaded,
         'skipped': skipped,
         'errors': errors[:5]
