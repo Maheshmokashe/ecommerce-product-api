@@ -13,7 +13,7 @@ class ProductViewSet(viewsets.ModelViewSet):
     queryset = Product.objects.filter(is_active=True).select_related('category', 'retailer')
     serializer_class = ProductSerializer
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
-    search_fields = ['name', 'sku', 'category__name']
+    search_fields = ['name', 'sku', 'category__name', 'brand']
     ordering_fields = ['price', 'created_at']
 
     def get_permissions(self):
@@ -92,6 +92,24 @@ def parse_product(product, retailer_obj):
     desc_raw = product.findtext('Description') or ''
     desc_clean = re.sub(r'<[^>]+>', ' ', desc_raw).strip()
 
+    # Additional images from Color element
+    additional_images = []
+    color_elem = product.find('Color')
+    if color_elem is not None:
+        for img in color_elem.findall('AdditionalImageURL'):
+            if img.text:
+                additional_images.append(img.text)
+
+    # Colors
+    colors = []
+    for color in product.findall('Color'):
+        color_name = color.findtext('n') or color.findtext('Name') or ''
+        if color_name and color_name not in colors:
+            colors.append(color_name)
+
+    # Sizes
+    sizes = [s.text for s in product.findall('Size') if s.text]
+
     return {
         'sku': sku,
         'name': name[:255],
@@ -101,6 +119,10 @@ def parse_product(product, retailer_obj):
         'stock': stock,
         'source_url': product.findtext('ProductURL') or '',
         'image_url': product.findtext('PrimaryImageURL') or '',
+        'additional_images': ','.join(additional_images[:6]),
+        'colors': ','.join(colors),
+        'sizes': ','.join(sizes),
+        'brand': brand,
         'retailer': retailer_obj,
     }
 
@@ -143,7 +165,7 @@ def upload_xml(request):
         defaults={'slug': slug, 'is_active': True, 'website': website}
     )
 
-    # Update website if it was empty before
+    # Update website if empty
     if not retailer_obj.website and website:
         retailer_obj.website = website
         retailer_obj.save()
@@ -176,10 +198,14 @@ def upload_xml(request):
                 description=data['description'],
                 category=category,
                 retailer=data['retailer'],
+                brand=data['brand'],
                 price=data['price'],
                 stock=data['stock'],
                 source_url=data['source_url'],
                 image_url=data['image_url'],
+                additional_images=data['additional_images'],
+                colors=data['colors'],
+                sizes=data['sizes'],
                 is_active=True
             )
             loaded += 1
