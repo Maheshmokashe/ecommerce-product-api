@@ -34,7 +34,7 @@ def search_products(
     q: str = Query(..., description="Search keyword"),
     min_price: float = Query(None, description="Minimum price"),
     max_price: float = Query(None, description="Maximum price"),
-    limit: int = Query(20, le=100)
+    limit: int = Query(100, le=500)
 ):
     conn = get_connection()
     filters = ["p.is_active = 1", "(p.name LIKE %s OR p.sku LIKE %s)"]
@@ -49,9 +49,11 @@ def search_products(
 
     where = " AND ".join(filters)
     sql = f"""
-        SELECT p.id, p.sku, p.name, p.price, p.stock, p.source_url, c.name AS category
+        SELECT p.id, p.sku, p.name, p.price, p.stock, p.source_url, p.image_url,
+               c.name AS category, r.name AS retailer
         FROM products_product p
         LEFT JOIN products_category c ON p.category_id = c.id
+        LEFT JOIN products_retailer r ON p.retailer_id = r.id
         WHERE {where}
         ORDER BY p.price ASC
         LIMIT %s
