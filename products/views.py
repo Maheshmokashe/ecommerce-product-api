@@ -5,6 +5,7 @@ from rest_framework.parsers import MultiPartParser
 from rest_framework.response import Response
 from .models import Product, Category, Retailer
 from .serializers import ProductSerializer, CategorySerializer, RetailerSerializer
+from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
 import re
 
@@ -129,10 +130,23 @@ def upload_xml(request):
     first = products[0]
     retailer_name = first.findtext('Retailer') or 'Unknown Retailer'
     slug = re.sub(r'[^a-z0-9]+', '-', retailer_name.lower()).strip('-')
+
+    # Auto-extract website from ProductURL
+    website = ''
+    product_url = first.findtext('ProductURL') or ''
+    if product_url:
+        parsed = urlparse(product_url)
+        website = f"{parsed.scheme}://{parsed.netloc}"
+
     retailer_obj, created = Retailer.objects.get_or_create(
         name=retailer_name,
-        defaults={'slug': slug, 'is_active': True}
+        defaults={'slug': slug, 'is_active': True, 'website': website}
     )
+
+    # Update website if it was empty before
+    if not retailer_obj.website and website:
+        retailer_obj.website = website
+        retailer_obj.save()
 
     loaded = 0
     skipped = 0
