@@ -65,28 +65,10 @@ def parse_price(price_str):
     cleaned = re.sub(r'[^\d.,]', '', price_str).strip()
     if not cleaned:
         return 0.0
-
-    # European format: 1.299,00 (has both dot and comma, comma is decimal)
     if ',' in cleaned and '.' in cleaned:
-        # Check if comma comes AFTER dot → European (1.299,00)
-        if cleaned.index(',') > cleaned.index('.'):
-            cleaned = cleaned.replace('.', '').replace(',', '.')
-        else:
-            # Dot comes after comma → dot is decimal (1,299.00)
-            cleaned = cleaned.replace(',', '')
-
+        cleaned = cleaned.replace('.', '').replace(',', '.')
     elif ',' in cleaned:
-        # Only comma present
-        parts = cleaned.split(',')
-        last_part = parts[-1]
-
-        # If last part is exactly 2 digits → European decimal (499,00 → 499.00)
-        if len(last_part) == 2:
-            cleaned = cleaned.replace(',', '.')
-        else:
-            # Thousands separator (12,000 → 12000)
-            cleaned = cleaned.replace(',', '')
-
+        cleaned = cleaned.replace(',', '.')
     try:
         return float(cleaned)
     except:
