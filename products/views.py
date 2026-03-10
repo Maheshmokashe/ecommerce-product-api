@@ -8,6 +8,7 @@ from .serializers import ProductSerializer, CategorySerializer, RetailerSerializ
 from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
 import re
+import html
 
 class ProductViewSet(viewsets.ModelViewSet):
     queryset = Product.objects.filter(is_active=True).select_related('category', 'retailer')
@@ -31,43 +32,100 @@ class RetailerViewSet(viewsets.ModelViewSet):
     serializer_class = RetailerSerializer
     permission_classes = [IsAuthenticated]
 
+def detect_currency(retailer_name, price_str):
+    """Detect currency from last word of retailer name (region code)"""
+    region_currency_map = {
+        # Asia
+        'IN':  '₹',
+        'KR':  '₩',
+        'JP':  '¥',
+        'CN':  '¥',
+        'HK':  'HK$',
+        'SG':  'S$',
+        'TH':  '฿',
+        'MY':  'RM',
+        # Europe
+        'UK':  '£',
+        'GB':  '£',
+        'DE':  '€',
+        'FR':  '€',
+        'IT':  '€',
+        'ES':  '€',
+        'NL':  '€',
+        'SE':  'kr',
+        'NO':  'kr',
+        'DK':  'kr',
+        'PL':  'zł',
+        'CH':  'CHF',
+        # Americas
+        'US':  '$',
+        'CA':  'CA$',
+        'MX':  'MX$',
+        'BR':  'R$',
+        # Middle East & Africa
+        'AE':  'AED',
+        'SA':  'SAR',
+        'ZA':  'R',
+        # Oceania
+        'AU':  'A$',
+        'NZ':  'NZ$',
+    }
+
+    # Extract last word as region code
+    parts = retailer_name.strip().split()
+    if parts:
+        region = parts[-1].upper()
+        if region in region_currency_map:
+            return region_currency_map[region]
+
+    # Fallback — check price string symbol
+    if '£' in price_str: return '£'
+    if '€' in price_str: return '€'
+    if '$' in price_str: return '$'
+    if '₹' in price_str: return '₹'
+
+    return '₹'  # final default
+
 def parse_price(price_str):
     if not price_str:
         return 0.0
-    cleaned = re.sub(r'[^\d.]', '', price_str)
+    # Remove currency symbols and spaces, keep digits, dots, commas
+    cleaned = re.sub(r'[^\d.,]', '', price_str).strip()
+    if not cleaned:
+        return 0.0
+    # European format: 1.299,00 → remove dots, replace comma with dot
+    if ',' in cleaned and '.' in cleaned:
+        cleaned = cleaned.replace('.', '').replace(',', '.')
+    elif ',' in cleaned:
+        # Format like 499,00 — comma is decimal separator
+        cleaned = cleaned.replace(',', '.')
+    # else normal format like 499.00 or 2499
     try:
         return float(cleaned)
     except:
         return 0.0
 
 def parse_product(product, retailer_obj):
-    # SKU — from Variant first
+    # SKU
     sku = None
     variant = product.find('Variant')
     if variant is not None:
         sku = variant.findtext('SKU')
-
-    # Fallback to Description
     if not sku:
         desc = product.findtext('Description') or ''
         sku_match = re.search(r'SKU\s+(\S+)', desc)
         if sku_match:
             sku = sku_match.group(1)
-
-    # Fallback to ProductId
     if not sku:
         sku = product.findtext('ProductId')
-
     if not sku:
         return None
 
-    # Name
+    # Name & Brand
     name = product.findtext('n') or product.findtext('Name') or 'Unknown'
     brand = product.findtext('Brand') or ''
-    if brand:
-        name = f"{name} by {brand}"
 
-    # Category — use second Part (most specific)
+    # Category
     category_name = 'Uncategorized'
     first_category = product.find('Category')
     if first_category is not None:
@@ -77,22 +135,38 @@ def parse_product(product, retailer_obj):
         elif parts:
             category_name = parts[0]
 
-    # Price — from Variant first, fallback to product level
+    # Price — check variant first, then product level
     price_str = ''
+    sale_price_str = ''
     if variant is not None:
         price_str = variant.findtext('Price') or ''
+        sale_price_str = variant.findtext('SalePrice') or variant.findtext('Sale_Price') or ''
     if not price_str:
         price_str = product.findtext('Price') or '0'
+    if not sale_price_str:
+        sale_price_str = product.findtext('SalePrice') or product.findtext('Sale_Price') or ''
 
-    # Stock — use StockIndicator directly
+    # Currency
+    currency = detect_currency(retailer_obj.name, price_str)
+
+    # Parse prices
+    regular_price = parse_price(price_str)
+    sale_price = parse_price(sale_price_str) if sale_price_str else None
+
+    # If sale price >= regular price, ignore it
+    if sale_price and sale_price >= regular_price:
+        sale_price = None
+
+    # Stock
     stock_indicator = product.findtext('StockIndicator') or 'false'
     stock = 1 if stock_indicator.lower() == 'true' else 0
 
-    # Description — strip HTML
+    # Description — strip HTML tags then decode HTML entities
     desc_raw = product.findtext('Description') or ''
     desc_clean = re.sub(r'<[^>]+>', ' ', desc_raw).strip()
+    desc_clean = html.unescape(desc_clean)
 
-    # Additional images from Color element
+    # Additional images
     additional_images = []
     color_elem = product.find('Color')
     if color_elem is not None:
@@ -115,7 +189,9 @@ def parse_product(product, retailer_obj):
         'name': name[:255],
         'description': desc_clean,
         'category_name': category_name,
-        'price': parse_price(price_str),
+        'price': regular_price,
+        'sale_price': sale_price,
+        'currency': currency,
         'stock': stock,
         'source_url': product.findtext('ProductURL') or '',
         'image_url': product.findtext('PrimaryImageURL') or '',
@@ -140,20 +216,14 @@ def upload_xml(request):
     except ET.ParseError as e:
         return Response({'error': f'Invalid XML: {str(e)}'}, status=400)
 
-    if root.tag == 'Product':
-        products = [root]
-    else:
-        products = root.findall('Product')
-
+    products = [root] if root.tag == 'Product' else root.findall('Product')
     if not products:
         return Response({'error': 'No products found in XML'}, status=400)
 
-    # Auto-detect retailer from first product's <Retailer> tag
     first = products[0]
     retailer_name = first.findtext('Retailer') or 'Unknown Retailer'
     slug = re.sub(r'[^a-z0-9]+', '-', retailer_name.lower()).strip('-')
 
-    # Auto-extract website from ProductURL
     website = ''
     product_url = first.findtext('ProductURL') or ''
     if product_url:
@@ -164,24 +234,19 @@ def upload_xml(request):
         name=retailer_name,
         defaults={'slug': slug, 'is_active': True, 'website': website}
     )
-
-    # Update website if empty
     if not retailer_obj.website and website:
         retailer_obj.website = website
         retailer_obj.save()
 
-    loaded = 0
-    skipped = 0
+    loaded = skipped = 0
     errors = []
 
     for product in products:
         try:
             data = parse_product(product, retailer_obj)
-
             if not data:
                 skipped += 1
                 continue
-
             if Product.objects.filter(sku=data['sku']).exists():
                 skipped += 1
                 continue
@@ -200,6 +265,8 @@ def upload_xml(request):
                 retailer=data['retailer'],
                 brand=data['brand'],
                 price=data['price'],
+                sale_price=data['sale_price'],
+                currency=data['currency'],
                 stock=data['stock'],
                 source_url=data['source_url'],
                 image_url=data['image_url'],
