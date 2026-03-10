@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Product, Category, Retailer
+from .models import Product, Category, Retailer, UploadLog
 
 class CategorySerializer(serializers.ModelSerializer):
     class Meta:
@@ -21,3 +21,8 @@ class ProductSerializer(serializers.ModelSerializer):
                   'retailer', 'retailer_name', 'brand', 'price', 'sale_price',
                   'currency', 'stock', 'source_url', 'image_url',
                   'additional_images', 'colors', 'sizes', 'is_active']
+class UploadLogSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = UploadLog
+        fields = ['id', 'retailer_name', 'filename', 'loaded', 'skipped',
+                  'total_found', 'status', 'error_message', 'uploaded_by', 'created_at']

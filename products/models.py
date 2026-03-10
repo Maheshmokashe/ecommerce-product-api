@@ -45,3 +45,21 @@ class Product(models.Model):
 
     def __str__(self):
         return self.name
+
+
+class UploadLog(models.Model):
+    retailer_name = models.CharField(max_length=100)
+    filename = models.CharField(max_length=255, blank=True, default='')
+    loaded = models.IntegerField(default=0)
+    skipped = models.IntegerField(default=0)
+    total_found = models.IntegerField(default=0)
+    status = models.CharField(max_length=20, default='success')  # success / failed
+    error_message = models.TextField(blank=True, default='')
+    uploaded_by = models.CharField(max_length=100, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.retailer_name} - {self.created_at}"
