@@ -269,3 +269,34 @@ def upload_xml(request):
         'total_found': total_found,
         'errors': errors[:5]
     })
+
+@api_view(['POST'])
+@permission_classes([IsAdminUser])
+def bulk_delete_products(request):
+    ids = request.data.get('ids', [])
+    if not ids:
+        return Response({'error': 'No product IDs provided'}, status=400)
+    deleted_count, _ = Product.objects.filter(id__in=ids).delete()
+    return Response({
+        'message': f'Successfully deleted {deleted_count} products',
+        'deleted': deleted_count
+    })
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def category_stats(request):
+    from django.db.models import Count, Avg, Q
+    stats = Category.objects.annotate(
+        total=Count('product'),
+        available=Count('product', filter=Q(product__stock=1)),
+        avg_price=Avg('product__price')
+    ).order_by('-total')
+    data = [{
+        'id': c.id,
+        'name': c.name,
+        'slug': c.slug,
+        'total': c.total,
+        'available': c.available,
+        'avg_price': round(float(c.avg_price), 2) if c.avg_price else 0
+    } for c in stats]
+    return Response(data)
