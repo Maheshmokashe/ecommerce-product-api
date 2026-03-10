@@ -4,6 +4,8 @@ class Retailer(models.Model):
     name = models.CharField(max_length=100, unique=True)
     slug = models.SlugField(max_length=100, unique=True)
     website = models.URLField(blank=True, default='')
+    feed_url = models.URLField(blank=True, default='', max_length=500)
+    last_fetched_at = models.DateTimeField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
 

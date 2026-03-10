@@ -9,7 +9,7 @@ class CategorySerializer(serializers.ModelSerializer):
 class RetailerSerializer(serializers.ModelSerializer):
     class Meta:
         model = Retailer
-        fields = ['id', 'name', 'slug', 'website', 'is_active']
+        fields = ['id', 'name', 'slug', 'website', 'feed_url', 'last_fetched_at', 'is_active', 'created_at']
 
 class ProductSerializer(serializers.ModelSerializer):
     category_name = serializers.CharField(source='category.name', read_only=True)

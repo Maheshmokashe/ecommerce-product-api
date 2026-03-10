@@ -1,7 +1,8 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (ProductViewSet, CategoryViewSet, RetailerViewSet,
-                    UploadLogViewSet, upload_xml, bulk_delete_products, category_stats)
+                    UploadLogViewSet, upload_xml, bulk_delete_products,
+                    category_stats, update_feed_url, refresh_feed)
 
 router = DefaultRouter()
 router.register(r'products', ProductViewSet)
@@ -14,4 +15,6 @@ urlpatterns = [
     path('upload-xml/', upload_xml),
     path('bulk-delete/', bulk_delete_products),
     path('category-stats/', category_stats),
+    path('retailers/<int:retailer_id>/update-feed/', update_feed_url),
+    path('retailers/<int:retailer_id>/refresh-feed/', refresh_feed),
 ]

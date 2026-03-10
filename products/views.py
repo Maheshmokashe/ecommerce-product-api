@@ -300,3 +300,113 @@ def category_stats(request):
         'avg_price': round(float(c.avg_price), 2) if c.avg_price else 0
     } for c in stats]
     return Response(data)
+
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def update_feed_url(request, retailer_id):
+    try:
+        retailer = Retailer.objects.get(id=retailer_id)
+    except Retailer.DoesNotExist:
+        return Response({'error': 'Retailer not found'}, status=404)
+    feed_url = request.data.get('feed_url', '').strip()
+    if not feed_url:
+        return Response({'error': 'feed_url is required'}, status=400)
+    retailer.feed_url = feed_url
+    retailer.save()
+    return Response({'message': 'Feed URL updated', 'feed_url': feed_url})
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def refresh_feed(request, retailer_id):
+    import urllib.request
+    from django.utils import timezone
+
+    try:
+        retailer = Retailer.objects.get(id=retailer_id)
+    except Retailer.DoesNotExist:
+        return Response({'error': 'Retailer not found'}, status=404)
+
+    if not retailer.feed_url:
+        return Response({'error': 'No feed URL set for this retailer'}, status=400)
+
+    try:
+        with urllib.request.urlopen(retailer.feed_url, timeout=30) as response:
+            xml_data = response.read()
+    except Exception as e:
+        return Response({'error': f'Failed to fetch feed: {str(e)}'}, status=400)
+
+    try:
+        import io
+        root = ET.fromstring(xml_data)
+    except ET.ParseError as e:
+        return Response({'error': f'Invalid XML: {str(e)}'}, status=400)
+
+    products = [root] if root.tag == 'Product' else root.findall('Product')
+    if not products:
+        return Response({'error': 'No products found in feed'}, status=400)
+
+    loaded = skipped = 0
+    errors = []
+    total_found = len(products)
+
+    for product in products:
+        try:
+            data = parse_product(product, retailer)
+            if not data:
+                skipped += 1
+                continue
+            cat_slug = data['category_name'].lower().replace(' ', '-').replace('/', '-').replace('&', 'and')
+            category, _ = Category.objects.get_or_create(
+                name=data['category_name'],
+                defaults={'slug': cat_slug}
+            )
+            obj, created = Product.objects.update_or_create(
+                sku=data['sku'],
+                defaults={
+                    'name': data['name'],
+                    'description': data['description'],
+                    'category': category,
+                    'retailer': retailer,
+                    'brand': data['brand'],
+                    'price': data['price'],
+                    'sale_price': data['sale_price'],
+                    'currency': data['currency'],
+                    'stock': data['stock'],
+                    'source_url': data['source_url'],
+                    'image_url': data['image_url'],
+                    'additional_images': data['additional_images'],
+                    'colors': data['colors'],
+                    'sizes': data['sizes'],
+                    'is_active': True,
+                }
+            )
+            loaded += 1
+        except Exception as e:
+            errors.append(str(e))
+            skipped += 1
+
+    retailer.last_fetched_at = timezone.now()
+    retailer.save()
+
+    UploadLog.objects.create(
+        retailer_name=retailer.name,
+        filename=retailer.feed_url,
+        loaded=loaded,
+        skipped=skipped,
+        total_found=total_found,
+        status='success',
+        error_message=', '.join(errors[:3]),
+        uploaded_by=request.user.username
+    )
+
+    return Response({
+        'message': f'Feed refreshed! Loaded: {loaded} | Skipped: {skipped}',
+        'loaded': loaded,
+        'skipped': skipped,
+        'total_found': total_found,
+        'last_fetched_at': retailer.last_fetched_at,
+        'errors': errors[:5]
+    })
