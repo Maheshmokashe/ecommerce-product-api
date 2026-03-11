@@ -71,7 +71,6 @@ def parse_price(price_str):
     cleaned = re.sub(r'[^\d.,]', '', price_str).strip()
     if not cleaned:
         return 0.0
-
     if ',' in cleaned and '.' in cleaned:
         if cleaned.index(',') > cleaned.index('.'):
             cleaned = cleaned.replace('.', '').replace(',', '.')
@@ -84,7 +83,6 @@ def parse_price(price_str):
             cleaned = cleaned.replace(',', '.')
         else:
             cleaned = cleaned.replace(',', '')
-
     try:
         return float(cleaned)
     except:
@@ -132,7 +130,6 @@ def parse_product(product, retailer_obj):
     name = product.findtext('n') or product.findtext('Name') or 'Unknown'
     brand = product.findtext('Brand') or ''
 
-    # Extract full category path
     category_parts = []
     first_category = product.find('Category')
     if first_category is not None:
@@ -301,6 +298,8 @@ def upload_xml(request):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def category_stats(request):
+    retailer_name = request.query_params.get('retailer', None)
+
     def get_all_descendant_ids(cat):
         ids = [cat.id]
         for child in cat.children.all():
@@ -312,8 +311,13 @@ def category_stats(request):
         result = []
         for c in cats:
             all_ids = get_all_descendant_ids(c)
-            total = Product.objects.filter(category_id__in=all_ids).count()
-            available = Product.objects.filter(category_id__in=all_ids, stock=1).count()
+            qs = Product.objects.filter(category_id__in=all_ids)
+            if retailer_name:
+                qs = qs.filter(retailer__name=retailer_name)
+            total = qs.count()
+            available = qs.filter(stock=1).count()
+            if total == 0:
+                continue
             result.append({
                 'id': c.id,
                 'name': c.name,
