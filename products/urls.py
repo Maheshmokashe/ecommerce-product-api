@@ -3,7 +3,8 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     ProductViewSet, CategoryViewSet, RetailerViewSet,
     UploadLogViewSet, upload_xml, bulk_delete_products,
-    category_stats, update_feed_url, refresh_feed, analytics
+    category_stats, update_feed_url, refresh_feed, analytics,
+    qa_data_quality, qa_validate_feed
 )
 
 router = DefaultRouter()
@@ -20,4 +21,6 @@ urlpatterns = [
     path('analytics/', analytics),
     path('retailers/<int:retailer_id>/update-feed/', update_feed_url),
     path('retailers/<int:retailer_id>/refresh-feed/', refresh_feed),
+    path('qa/data-quality/', qa_data_quality),
+    path('qa/validate-feed/', qa_validate_feed),
 ]
