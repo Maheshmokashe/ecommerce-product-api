@@ -1130,3 +1130,292 @@ def qa_validate_feed(request):
         'duplicate_sku_list': list(duplicates.items())[:20],
         'parsed_samples': parsed_samples,  # first 5 products preview
     })
+
+# ─────────────────────────────────────────────
+# QA — Fix Suggestions (field-level drill down)
+# ─────────────────────────────────────────────
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def qa_fix_suggestions(request):
+    from django.db.models import Q
+    retailer_filter = request.GET.get('retailer', None)
+    qs = Product.objects.filter(is_active=True).select_related('retailer', 'category')
+    if retailer_filter:
+        qs = qs.filter(retailer__name=retailer_filter)
+    total = qs.count()
+    if total == 0:
+        return Response({'error': 'No products found'}, status=400)
+
+    suggestions = []
+
+    no_brand = qs.filter(Q(brand='') | Q(brand__isnull=True))
+    if no_brand.exists():
+        sample_retailer = no_brand.first().retailer.name if no_brand.first().retailer else ''
+        suggestions.append({
+            'field': 'brand', 'icon': '🏷️', 'severity': 'medium',
+            'affected': no_brand.count(), 'pct': round(no_brand.count() / total * 100, 1),
+            'title': 'Missing Brand',
+            'suggestion': f'Consider using the retailer name as brand (e.g. "{sample_retailer}"), or extract brand from the first word of product name.',
+            'samples': list(no_brand.values('sku', 'name', 'retailer__name')[:5]),
+        })
+
+    no_image = qs.filter(Q(image_url='') | Q(image_url__isnull=True))
+    if no_image.exists():
+        suggestions.append({
+            'field': 'image_url', 'icon': '🖼️', 'severity': 'high',
+            'affected': no_image.count(), 'pct': round(no_image.count() / total * 100, 1),
+            'title': 'Missing Image URL',
+            'suggestion': 'Check if the XML feed  & product page have image URLS.',
+            'samples': list(no_image.values('sku', 'name', 'retailer__name')[:5]),
+        })
+
+    no_desc = qs.filter(Q(description='') | Q(description__isnull=True))
+    if no_desc.exists():
+        suggestions.append({
+            'field': 'description', 'icon': '📝', 'severity': 'medium',
+            'affected': no_desc.count(), 'pct': round(no_desc.count() / total * 100, 1),
+            'title': 'Missing Description',
+            'suggestion': 'Products with "Not Available" description are saved as empty. Consider using product name + category as a fallback description.',
+            'samples': list(no_desc.values('sku', 'name', 'retailer__name')[:5]),
+        })
+
+    zero_price = qs.filter(price__lte=0)
+    if zero_price.exists():
+        suggestions.append({
+            'field': 'price', 'icon': '💰', 'severity': 'critical',
+            'affected': zero_price.count(), 'pct': round(zero_price.count() / total * 100, 1),
+            'title': 'Zero or Missing Price',
+            'suggestion': "Price is ₹0 — variant's <Price> tag was likely empty. Check if price is available on the product page.",
+            'samples': list(zero_price.values('sku', 'name', 'retailer__name', 'price')[:5]),
+        })
+
+    no_cat = qs.filter(category__isnull=True)
+    if no_cat.exists():
+        suggestions.append({
+            'field': 'category', 'icon': '🗂️', 'severity': 'high',
+            'affected': no_cat.count(), 'pct': round(no_cat.count() / total * 100, 1),
+            'title': 'No Category Assigned',
+            'suggestion': 'Products have no <Category><Part> elements in the feed. They are saved as Uncategorized. Check the site categories.',
+            'samples': list(no_cat.values('sku', 'name', 'retailer__name')[:5]),
+        })
+
+    no_colors = qs.filter(Q(colors='') | Q(colors__isnull=True))
+    if no_colors.exists():
+        suggestions.append({
+            'field': 'colors', 'icon': '🎨', 'severity': 'low',
+            'affected': no_colors.count(), 'pct': round(no_colors.count() / total * 100, 1),
+            'title': 'Missing Colors',
+            'suggestion': 'Color name not found in <Color><n> or <Color><Name> tags. Check if product has color or not.',
+            'samples': list(no_colors.values('sku', 'name', 'retailer__name')[:5]),
+        })
+
+    no_sizes = qs.filter(Q(sizes='') | Q(sizes__isnull=True))
+    if no_sizes.exists():
+        suggestions.append({
+            'field': 'sizes', 'icon': '📐', 'severity': 'low',
+            'affected': no_sizes.count(), 'pct': round(no_sizes.count() / total * 100, 1),
+            'title': 'Missing Sizes',
+            'suggestion': 'No <Size> tags found at product level. Sizes might be inside <Variant><Size> instead.',
+            'samples': list(no_sizes.values('sku', 'name', 'retailer__name')[:5]),
+        })
+
+    bad_sale = qs.filter(sale_price__isnull=False, sale_price__gte=models.F('price'))
+    if bad_sale.exists():
+        suggestions.append({
+            'field': 'sale_price', 'icon': '🔄', 'severity': 'critical',
+            'affected': bad_sale.count(), 'pct': round(bad_sale.count() / total * 100, 1),
+            'title': 'Sale Price >= Regular Price',
+            'suggestion': 'Sale price should always be lower than regular price. This is a data entry error in the retailer feed. ',
+            'samples': list(bad_sale.values('sku', 'name', 'retailer__name', 'price', 'sale_price')[:5]),
+        })
+
+    suggestions.sort(key=lambda x: {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}[x['severity']])
+    return Response({'total_products': total, 'suggestions': suggestions, 'total_suggestions': len(suggestions)})
+
+
+# ─────────────────────────────────────────────
+# QA — Advanced Validation Rules
+# ─────────────────────────────────────────────
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def qa_advanced_rules(request):
+    from django.db.models import Q, Avg, Count as Cnt
+    retailer_filter = request.GET.get('retailer', None)
+    qs = Product.objects.filter(is_active=True).select_related('retailer', 'category')
+    if retailer_filter:
+        qs = qs.filter(retailer__name=retailer_filter)
+    total = qs.count()
+    if total == 0:
+        return Response({'error': 'No products found'}, status=400)
+
+    results = {}
+
+    # 1. Duplicate Product Names
+    dup_names = (
+        qs.values('name', 'retailer__name')
+        .annotate(cnt=Cnt('id'))
+        .filter(cnt__gt=1)
+        .order_by('-cnt')[:20]
+    )
+    results['duplicate_names'] = {
+        'count': dup_names.count(),
+        'items': list(dup_names),
+        'description': 'Products with identical names within the same retailer — possible duplicates or variants that should be merged.',
+    }
+
+    # 2. Price Outliers per Category
+    outliers = []
+    categories_with_products = (
+        qs.exclude(category=None)
+        .values('category__name', 'category__id')
+        .annotate(cnt=Cnt('id'), avg=Avg('price'))
+        .filter(cnt__gte=5)
+        .order_by('-cnt')[:20]
+    )
+    for cat in categories_with_products:
+        cat_qs = qs.filter(category__id=cat['category__id'])
+        avg = float(cat['avg'] or 0)
+        if avg == 0:
+            continue
+        high_outliers = cat_qs.filter(price__gt=avg * 3).count()
+        low_outliers  = cat_qs.filter(price__gt=0, price__lt=avg * 0.1).count()
+        if high_outliers > 0 or low_outliers > 0:
+            outliers.append({
+                'category': cat['category__name'],
+                'avg_price': round(avg, 2),
+                'total_products': cat['cnt'],
+                'high_outliers': high_outliers,
+                'low_outliers': low_outliers,
+                'high_threshold': round(avg * 3, 2),
+                'low_threshold': round(avg * 0.1, 2),
+                'samples_high': list(cat_qs.filter(price__gt=avg * 3).values('sku', 'name', 'price', 'retailer__name')[:3]),
+                'samples_low':  list(cat_qs.filter(price__gt=0, price__lt=avg * 0.1).values('sku', 'name', 'price', 'retailer__name')[:3]),
+            })
+    results['price_outliers'] = {
+        'count': len(outliers),
+        'items': outliers[:15],
+        'description': 'Products priced 3x above or below their category average — likely data entry errors.',
+    }
+
+    # 3. SKU Format Validation
+    all_skus = list(qs.values_list('sku', 'name', 'retailer__name')[:5000])
+    short_skus   = [{'sku': s, 'name': n, 'retailer': r} for s, n, r in all_skus if len(s) < 4]
+    long_skus    = [{'sku': s, 'name': n, 'retailer': r} for s, n, r in all_skus if len(s) > 30]
+    special_char = [{'sku': s, 'name': n, 'retailer': r} for s, n, r in all_skus if re.search(r'[^a-zA-Z0-9\-_]', s)]
+    results['sku_validation'] = {
+        'total_checked': len(all_skus),
+        'short_skus':    {'count': len(short_skus),   'description': 'SKUs shorter than 4 characters',        'samples': short_skus[:10]},
+        'long_skus':     {'count': len(long_skus),    'description': 'SKUs longer than 30 characters',        'samples': long_skus[:10]},
+        'special_chars': {'count': len(special_char), 'description': 'SKUs with special characters',          'samples': special_char[:10]},
+    }
+
+    # 4. Image URL Reachability (sample 20)
+    import urllib.request as urlreq
+    image_sample = list(qs.exclude(Q(image_url='') | Q(image_url__isnull=True)).values_list('sku', 'name', 'image_url', 'retailer__name')[:20])
+    reachable = []
+    unreachable = []
+    for sku, name, url, r_name in image_sample:
+        try:
+            req = urlreq.Request(url, method='HEAD', headers={'User-Agent': 'Mozilla/5.0'})
+            with urlreq.urlopen(req, timeout=3) as resp:
+                if resp.status < 400:
+                    reachable.append({'sku': sku, 'name': name[:40], 'url': url, 'status': resp.status})
+                else:
+                    unreachable.append({'sku': sku, 'name': name[:40], 'url': url, 'status': resp.status})
+        except Exception as e:
+            unreachable.append({'sku': sku, 'name': name[:40], 'url': url, 'error': str(e)[:80]})
+
+    total_with_image = qs.exclude(Q(image_url='') | Q(image_url__isnull=True)).count()
+    results['image_reachability'] = {
+        'sampled': len(image_sample),
+        'total_with_image': total_with_image,
+        'reachable': len(reachable),
+        'unreachable': len(unreachable),
+        'reachable_pct': round(len(reachable) / len(image_sample) * 100, 1) if image_sample else 0,
+        'note': f'Sampled 20 of {total_with_image} products with images (HEAD request, 3s timeout)',
+        'unreachable_samples': unreachable[:10],
+    }
+
+    return Response({'total_products': total, 'rules': results})
+
+
+# ─────────────────────────────────────────────
+# QA — Retailer Comparison Table
+# ─────────────────────────────────────────────
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def qa_retailer_comparison(request):
+    from django.db.models import Q, Avg
+    rows = []
+    for retailer in Retailer.objects.filter(is_active=True).order_by('name'):
+        qs = Product.objects.filter(is_active=True, retailer=retailer)
+        total = qs.count()
+        if total == 0:
+            continue
+        def pct(n): return round(n / total * 100, 1)
+        has_image    = qs.exclude(Q(image_url='') | Q(image_url__isnull=True)).count()
+        has_brand    = qs.exclude(Q(brand='') | Q(brand__isnull=True)).count()
+        has_desc     = qs.exclude(Q(description='') | Q(description__isnull=True)).count()
+        has_category = qs.filter(category__isnull=False).count()
+        has_colors   = qs.exclude(Q(colors='') | Q(colors__isnull=True)).count()
+        has_sizes    = qs.exclude(Q(sizes='') | Q(sizes__isnull=True)).count()
+        has_sale     = qs.filter(sale_price__isnull=False).count()
+        in_stock     = qs.filter(stock=1).count()
+        zero_price   = qs.filter(price__lte=0).count()
+        avg_price    = qs.aggregate(a=Avg('price'))['a'] or 0
+        score = round((pct(has_image) + pct(has_brand) + pct(has_desc) +
+                       pct(has_category) + pct(in_stock) + (100 - pct(zero_price))) / 6, 1)
+        rows.append({
+            'retailer': retailer.name, 'total': total, 'score': score,
+            'avg_price': round(float(avg_price), 2),
+            'fields': {
+                'image':       {'count': has_image,    'pct': pct(has_image)},
+                'brand':       {'count': has_brand,    'pct': pct(has_brand)},
+                'description': {'count': has_desc,     'pct': pct(has_desc)},
+                'category':    {'count': has_category, 'pct': pct(has_category)},
+                'colors':      {'count': has_colors,   'pct': pct(has_colors)},
+                'sizes':       {'count': has_sizes,    'pct': pct(has_sizes)},
+                'sale_price':  {'count': has_sale,     'pct': pct(has_sale)},
+                'in_stock':    {'count': in_stock,     'pct': pct(in_stock)},
+                'zero_price':  {'count': zero_price,   'pct': pct(zero_price)},
+            },
+        })
+    rows.sort(key=lambda x: x['score'], reverse=True)
+    return Response({'retailers': rows, 'fields': ['image','brand','description','category','colors','sizes','sale_price','in_stock','zero_price']})
+
+
+# ─────────────────────────────────────────────
+# QA — Auto-flag issues after upload
+# ─────────────────────────────────────────────
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def qa_upload_flags(request):
+    from django.db.models import Q
+    logs = UploadLog.objects.order_by('-created_at')[:20]
+    flagged = []
+    for log in logs:
+        qs = Product.objects.filter(is_active=True, retailer__name=log.retailer_name)
+        total = qs.count()
+        flags = []
+        if total > 0:
+            zero_p = qs.filter(price__lte=0).count()
+            no_img = qs.filter(Q(image_url='') | Q(image_url__isnull=True)).count()
+            no_cat = qs.filter(category__isnull=True).count()
+            bad_sp = qs.filter(sale_price__isnull=False, sale_price__gte=models.F('price')).count()
+            no_br  = qs.filter(Q(brand='') | Q(brand__isnull=True)).count()
+            if zero_p > 0: flags.append({'type': 'critical', 'msg': f'{zero_p} products with ₹0 price'})
+            if bad_sp > 0: flags.append({'type': 'critical', 'msg': f'{bad_sp} products: sale price >= regular price'})
+            if no_img > 0: flags.append({'type': 'high',     'msg': f'{no_img} products missing image URL'})
+            if no_cat > 0: flags.append({'type': 'high',     'msg': f'{no_cat} products with no category'})
+            if no_br  > 0: flags.append({'type': 'medium',   'msg': f'{no_br} products missing brand'})
+        flagged.append({
+            'log_id': log.id, 'retailer': log.retailer_name,
+            'uploaded_at': str(log.created_at)[:19],
+            'loaded': log.loaded, 'flags': flags, 'flag_count': len(flags),
+            'has_critical': any(f['type'] == 'critical' for f in flags),
+        })
+    return Response({'upload_flags': flagged})
