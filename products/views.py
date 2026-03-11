@@ -10,6 +10,7 @@ import xml.etree.ElementTree as ET
 import re
 import html
 
+
 class ProductViewSet(viewsets.ModelViewSet):
     queryset = Product.objects.filter(is_active=True).select_related('category', 'retailer')
     serializer_class = ProductSerializer
@@ -22,20 +23,24 @@ class ProductViewSet(viewsets.ModelViewSet):
             return [IsAdminUser()]
         return [IsAuthenticated()]
 
+
 class CategoryViewSet(viewsets.ModelViewSet):
     queryset = Category.objects.all()
     serializer_class = CategorySerializer
     permission_classes = [IsAuthenticated]
+
 
 class RetailerViewSet(viewsets.ModelViewSet):
     queryset = Retailer.objects.filter(is_active=True)
     serializer_class = RetailerSerializer
     permission_classes = [IsAuthenticated]
 
+
 class UploadLogViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = UploadLog.objects.all().order_by('-created_at')
     serializer_class = UploadLogSerializer
     permission_classes = [IsAuthenticated]
+
 
 def detect_currency(retailer_name, price_str):
     region_currency_map = {
@@ -59,20 +64,55 @@ def detect_currency(retailer_name, price_str):
     if '₹' in price_str: return '₹'
     return '₹'
 
+
 def parse_price(price_str):
     if not price_str:
         return 0.0
     cleaned = re.sub(r'[^\d.,]', '', price_str).strip()
     if not cleaned:
         return 0.0
+
     if ',' in cleaned and '.' in cleaned:
-        cleaned = cleaned.replace('.', '').replace(',', '.')
+        if cleaned.index(',') > cleaned.index('.'):
+            cleaned = cleaned.replace('.', '').replace(',', '.')
+        else:
+            cleaned = cleaned.replace(',', '')
     elif ',' in cleaned:
-        cleaned = cleaned.replace(',', '.')
+        parts = cleaned.split(',')
+        last_part = parts[-1]
+        if len(last_part) == 2:
+            cleaned = cleaned.replace(',', '.')
+        else:
+            cleaned = cleaned.replace(',', '')
+
     try:
         return float(cleaned)
     except:
         return 0.0
+
+
+def get_or_create_category_tree(parts):
+    if not parts:
+        cat, _ = Category.objects.get_or_create(
+            name='Uncategorized',
+            parent=None,
+            defaults={'slug': 'uncategorized', 'level': 0}
+        )
+        return cat
+
+    parent = None
+    category = None
+    for level, part in enumerate(parts):
+        slug = re.sub(r'[^a-z0-9]+', '-', part.lower()).strip('-')
+        category, _ = Category.objects.get_or_create(
+            name=part,
+            parent=parent,
+            defaults={'slug': slug, 'level': level}
+        )
+        parent = category
+
+    return category
+
 
 def parse_product(product, retailer_obj):
     sku = None
@@ -92,14 +132,12 @@ def parse_product(product, retailer_obj):
     name = product.findtext('n') or product.findtext('Name') or 'Unknown'
     brand = product.findtext('Brand') or ''
 
-    category_name = 'Uncategorized'
+    # Extract full category path
+    category_parts = []
     first_category = product.find('Category')
     if first_category is not None:
-        parts = [p.text for p in first_category.findall('Part') if p.text]
-        if len(parts) >= 2:
-            category_name = parts[1]
-        elif parts:
-            category_name = parts[0]
+        parts = [p.text.strip() for p in first_category.findall('Part') if p.text and p.text.strip()]
+        category_parts = parts
 
     price_str = ''
     sale_price_str = ''
@@ -143,7 +181,7 @@ def parse_product(product, retailer_obj):
         'sku': sku,
         'name': name[:255],
         'description': desc_clean,
-        'category_name': category_name,
+        'category_parts': category_parts,
         'price': regular_price,
         'sale_price': sale_price,
         'currency': currency,
@@ -156,6 +194,7 @@ def parse_product(product, retailer_obj):
         'brand': brand,
         'retailer': retailer_obj,
     }
+
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
@@ -173,12 +212,9 @@ def upload_xml(request):
         root = tree.getroot()
     except ET.ParseError as e:
         UploadLog.objects.create(
-            retailer_name='Unknown',
-            filename=filename,
+            retailer_name='Unknown', filename=filename,
             loaded=0, skipped=0, total_found=0,
-            status='failed',
-            error_message=str(e),
-            uploaded_by=uploaded_by
+            status='failed', error_message=str(e), uploaded_by=uploaded_by
         )
         return Response({'error': f'Invalid XML: {str(e)}'}, status=400)
 
@@ -218,11 +254,7 @@ def upload_xml(request):
                 skipped += 1
                 continue
 
-            cat_slug = data['category_name'].lower().replace(' ', '-').replace('/', '-').replace('&', 'and')
-            category, _ = Category.objects.get_or_create(
-                name=data['category_name'],
-                defaults={'slug': cat_slug}
-            )
+            category = get_or_create_category_tree(data['category_parts'])
 
             Product.objects.create(
                 sku=data['sku'],
@@ -248,15 +280,10 @@ def upload_xml(request):
             errors.append(str(e))
             skipped += 1
 
-    # Save upload log
     UploadLog.objects.create(
-        retailer_name=retailer_name,
-        filename=filename,
-        loaded=loaded,
-        skipped=skipped,
-        total_found=total_found,
-        status='success',
-        error_message=', '.join(errors[:3]),
+        retailer_name=retailer_name, filename=filename,
+        loaded=loaded, skipped=skipped, total_found=total_found,
+        status='success', error_message=', '.join(errors[:3]),
         uploaded_by=uploaded_by
     )
 
@@ -270,8 +297,40 @@ def upload_xml(request):
         'errors': errors[:5]
     })
 
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def category_stats(request):
+    def get_all_descendant_ids(cat):
+        ids = [cat.id]
+        for child in cat.children.all():
+            ids.extend(get_all_descendant_ids(child))
+        return ids
+
+    def build_tree(parent=None):
+        cats = Category.objects.filter(parent=parent).order_by('name')
+        result = []
+        for c in cats:
+            all_ids = get_all_descendant_ids(c)
+            total = Product.objects.filter(category_id__in=all_ids).count()
+            available = Product.objects.filter(category_id__in=all_ids, stock=1).count()
+            result.append({
+                'id': c.id,
+                'name': c.name,
+                'slug': c.slug,
+                'level': c.level,
+                'total': total,
+                'available': available,
+                'children': build_tree(parent=c)
+            })
+        return result
+
+    tree = build_tree(parent=None)
+    return Response(tree)
+
+
 @api_view(['POST'])
-@permission_classes([IsAdminUser])
+@permission_classes([IsAuthenticated])
 def bulk_delete_products(request):
     ids = request.data.get('ids', [])
     if not ids:
@@ -281,26 +340,6 @@ def bulk_delete_products(request):
         'message': f'Successfully deleted {deleted_count} products',
         'deleted': deleted_count
     })
-
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def category_stats(request):
-    from django.db.models import Count, Avg, Q
-    stats = Category.objects.annotate(
-        total=Count('product'),
-        available=Count('product', filter=Q(product__stock=1)),
-        avg_price=Avg('product__price')
-    ).order_by('-total')
-    data = [{
-        'id': c.id,
-        'name': c.name,
-        'slug': c.slug,
-        'total': c.total,
-        'available': c.available,
-        'avg_price': round(float(c.avg_price), 2) if c.avg_price else 0
-    } for c in stats]
-    return Response(data)
-
 
 
 @api_view(['POST'])
@@ -339,7 +378,6 @@ def refresh_feed(request, retailer_id):
         return Response({'error': f'Failed to fetch feed: {str(e)}'}, status=400)
 
     try:
-        import io
         root = ET.fromstring(xml_data)
     except ET.ParseError as e:
         return Response({'error': f'Invalid XML: {str(e)}'}, status=400)
@@ -358,12 +396,10 @@ def refresh_feed(request, retailer_id):
             if not data:
                 skipped += 1
                 continue
-            cat_slug = data['category_name'].lower().replace(' ', '-').replace('/', '-').replace('&', 'and')
-            category, _ = Category.objects.get_or_create(
-                name=data['category_name'],
-                defaults={'slug': cat_slug}
-            )
-            obj, created = Product.objects.update_or_create(
+
+            category = get_or_create_category_tree(data['category_parts'])
+
+            Product.objects.update_or_create(
                 sku=data['sku'],
                 defaults={
                     'name': data['name'],
@@ -384,6 +420,7 @@ def refresh_feed(request, retailer_id):
                 }
             )
             loaded += 1
+
         except Exception as e:
             errors.append(str(e))
             skipped += 1
@@ -392,13 +429,9 @@ def refresh_feed(request, retailer_id):
     retailer.save()
 
     UploadLog.objects.create(
-        retailer_name=retailer.name,
-        filename=retailer.feed_url,
-        loaded=loaded,
-        skipped=skipped,
-        total_found=total_found,
-        status='success',
-        error_message=', '.join(errors[:3]),
+        retailer_name=retailer.name, filename=retailer.feed_url,
+        loaded=loaded, skipped=skipped, total_found=total_found,
+        status='success', error_message=', '.join(errors[:3]),
         uploaded_by=request.user.username
     )
 

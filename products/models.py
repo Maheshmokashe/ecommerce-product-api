@@ -12,12 +12,25 @@ class Retailer(models.Model):
     def __str__(self):
         return self.name
 
+
 class Category(models.Model):
-    name = models.CharField(max_length=100, unique=True)
-    slug = models.SlugField(max_length=100, unique=True)
+    name = models.CharField(max_length=200)
+    slug = models.SlugField(max_length=200)
+    parent = models.ForeignKey(
+        'self',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='children'
+    )
+    level = models.IntegerField(default=0)  # 0=top, 1=mid, 2=child, 3=leaf
+
+    class Meta:
+        unique_together = [['name', 'parent']]
 
     def __str__(self):
         return self.name
+
 
 class Product(models.Model):
     sku = models.CharField(max_length=100, unique=True, db_index=True)
@@ -55,7 +68,7 @@ class UploadLog(models.Model):
     loaded = models.IntegerField(default=0)
     skipped = models.IntegerField(default=0)
     total_found = models.IntegerField(default=0)
-    status = models.CharField(max_length=20, default='success')  # success / failed
+    status = models.CharField(max_length=20, default='success')
     error_message = models.TextField(blank=True, default='')
     uploaded_by = models.CharField(max_length=100, blank=True, default='')
     created_at = models.DateTimeField(auto_now_add=True)
