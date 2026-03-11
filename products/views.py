@@ -99,9 +99,9 @@ def parse_price(price_str):
 
 def get_or_create_category_tree(parts, cache):
     """
-    Build category tree from parts list using in-memory cache.
-    Cache key: "Women||Western Wear||Dresses" → Category object
-    Avoids hitting DB for the same category on every product.
+    Build category tree from parts list.
+    Uses in-memory cache dict to avoid repeated DB hits.
+    cache key = "Part1||Part2||Part3"
     """
     if not parts:
         key = '__uncategorized__'
@@ -116,27 +116,28 @@ def get_or_create_category_tree(parts, cache):
 
     parent = None
     category = None
-    for level in range(len(parts)):
-        key = '||'.join(parts[:level + 1])
-        if key not in cache:
-            slug = re.sub(r'[^a-z0-9]+', '-', parts[level].lower()).strip('-')
+    for level, part in enumerate(parts):
+        # Build cache key up to this level e.g. "Women", "Women||Western Wear"
+        path_key = '||'.join(parts[:level + 1])
+        if path_key not in cache:
+            slug = re.sub(r'[^a-z0-9]+', '-', part.lower()).strip('-')
             category, _ = Category.objects.get_or_create(
-                name=parts[level],
+                name=part,
                 parent=parent,
                 defaults={'slug': slug, 'level': level}
             )
-            cache[key] = category
+            cache[path_key] = category
         else:
-            category = cache[key]
+            category = cache[path_key]
         parent = category
 
     return category
 
 
-def get_ancestors_from_cache(cat, ancestor_cache):
+def get_ancestors(cat, ancestor_cache):
     """
-    Walk up parent chain and return cat + all ancestors.
-    Uses ancestor_cache { cat.id: [list] } to avoid re-walking same path.
+    Return the category itself plus all ancestors.
+    Uses ancestor_cache to avoid repeated parent traversals.
     """
     if cat.id in ancestor_cache:
         return ancestor_cache[cat.id]
@@ -150,6 +151,23 @@ def get_ancestors_from_cache(cat, ancestor_cache):
 
     ancestor_cache[cat.id] = ancestors
     return ancestors
+
+
+def build_all_categories_with_ancestors(all_category_parts, cat_cache, ancestor_cache):
+    """
+    Given all category paths for one product,
+    return unique flat list of all categories + ancestors.
+    """
+    all_cats = []
+    seen_ids = set()
+    for parts in all_category_parts:
+        leaf_cat = get_or_create_category_tree(parts, cat_cache)
+        if leaf_cat:
+            for ancestor in get_ancestors(leaf_cat, ancestor_cache):
+                if ancestor.id not in seen_ids:
+                    all_cats.append(ancestor)
+                    seen_ids.add(ancestor.id)
+    return all_cats
 
 
 def parse_product(product, retailer_obj):
@@ -180,7 +198,9 @@ def parse_product(product, retailer_obj):
             all_category_parts.append(parts)
 
     # Primary category = longest path (most specific)
-    primary_parts = max(all_category_parts, key=len) if all_category_parts else []
+    primary_parts = []
+    if all_category_parts:
+        primary_parts = max(all_category_parts, key=len)
 
     # ── Price ─────────────────────────────────
     price_str = ''
@@ -247,8 +267,10 @@ def parse_product(product, retailer_obj):
 
 
 # ─────────────────────────────────────────────
-# Upload XML  (OPTIMIZED — bulk insert + cache)
+# Upload XML  (optimized with bulk insert + cache)
 # ─────────────────────────────────────────────
+
+BULK_BATCH_SIZE = 500  # insert 500 products at a time
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
@@ -295,20 +317,59 @@ def upload_xml(request):
         retailer_obj.website = website
         retailer_obj.save()
 
-    # ── STEP 1: Fetch all existing SKUs in ONE query ─────────────
+    # Pre-load existing SKUs to avoid per-product DB check
     existing_skus = set(
-        Product.objects.filter(retailer=retailer_obj).values_list('sku', flat=True)
+        Product.objects.filter(retailer=retailer_obj)
+        .values_list('sku', flat=True)
     )
 
-    # ── STEP 2: Parse + build categories with in-memory cache ────
-    category_cache = {}   # "Women||Western Wear" → Category obj
-    ancestor_cache = {}   # category.id → [cat, parent, grandparent, ...]
-
-    to_create = []        # Product objects for bulk_create
-    m2m_data = []         # [(sku, [cat_ids]), ...]
-    skipped = 0
+    loaded = skipped = 0
     errors = []
     total_found = len(products)
+
+    # Shared caches for the entire upload — built once, reused for all products
+    cat_cache = {}       # { "Women||Western Wear": <Category obj> }
+    ancestor_cache = {}  # { category_id: [cat, parent, grandparent...] }
+
+    # Batch buffers
+    product_batch = []           # Product objects to bulk_create
+    m2m_map = {}                 # { sku: [category_ids] } for M2M after bulk_create
+
+    def flush_batch():
+        """Insert current batch into DB and set M2M categories."""
+        nonlocal loaded
+        if not product_batch:
+            return
+
+        # Bulk insert — one query for entire batch!
+        created_products = Product.objects.bulk_create(
+            product_batch,
+            ignore_conflicts=True  # skip if SKU already exists
+        )
+
+        # Set M2M categories for each created product
+        # Re-fetch with SKUs to get actual DB IDs
+        skus_in_batch = [p.sku for p in product_batch]
+        db_products = {
+            p.sku: p for p in Product.objects.filter(sku__in=skus_in_batch)
+        }
+
+        m2m_through = Product.categories.through  # the junction table
+        through_objects = []
+        for sku, cat_ids in m2m_map.items():
+            prod = db_products.get(sku)
+            if prod:
+                for cat_id in cat_ids:
+                    through_objects.append(
+                        m2m_through(product_id=prod.id, category_id=cat_id)
+                    )
+
+        if through_objects:
+            m2m_through.objects.bulk_create(through_objects, ignore_conflicts=True)
+
+        loaded += len(created_products)
+        product_batch.clear()
+        m2m_map.clear()
 
     for product in products:
         try:
@@ -321,20 +382,19 @@ def upload_xml(request):
                 skipped += 1
                 continue
 
-            # Primary category for display on product cards
+            # Mark as seen so duplicates within same XML are skipped
+            existing_skus.add(data['sku'])
+
+            # Resolve categories using cache
             primary_category = get_or_create_category_tree(
-                data['primary_category_parts'], category_cache
+                data['primary_category_parts'], cat_cache
+            )
+            all_cats = build_all_categories_with_ancestors(
+                data['all_category_parts'], cat_cache, ancestor_cache
             )
 
-            # All categories + ancestors for M2M accurate counting
-            all_cat_ids = set()
-            for parts in data['all_category_parts']:
-                leaf = get_or_create_category_tree(parts, category_cache)
-                if leaf:
-                    for anc in get_ancestors_from_cache(leaf, ancestor_cache):
-                        all_cat_ids.add(anc.id)
-
-            to_create.append(Product(
+            # Add to batch (no DB write yet)
+            product_batch.append(Product(
                 sku=data['sku'],
                 name=data['name'],
                 description=data['description'],
@@ -350,45 +410,22 @@ def upload_xml(request):
                 additional_images=data['additional_images'],
                 colors=data['colors'],
                 sizes=data['sizes'],
-                is_active=True,
+                is_active=True
             ))
-            m2m_data.append((data['sku'], list(all_cat_ids)))
-            existing_skus.add(data['sku'])  # prevent in-file duplicates
+
+            m2m_map[data['sku']] = [c.id for c in all_cats]
+
+            # Flush every BULK_BATCH_SIZE products
+            if len(product_batch) >= BULK_BATCH_SIZE:
+                flush_batch()
 
         except Exception as e:
             errors.append(str(e))
             skipped += 1
 
-    # ── STEP 3: Bulk create products in batches of 500 ───────────
-    BATCH = 500
-    for i in range(0, len(to_create), BATCH):
-        Product.objects.bulk_create(to_create[i:i + BATCH], ignore_conflicts=True)
+    # Flush remaining products
+    flush_batch()
 
-    loaded = len(to_create)
-
-    # ── STEP 4: Bulk insert M2M rows ─────────────────────────────
-    skus_in_batch = [p.sku for p in to_create]
-    sku_to_id = dict(
-        Product.objects.filter(sku__in=skus_in_batch).values_list('sku', 'id')
-    )
-
-    Through = Product.categories.through
-    m2m_rows = []
-    seen_pairs = set()
-    for sku, cat_ids in m2m_data:
-        product_id = sku_to_id.get(sku)
-        if not product_id:
-            continue
-        for cat_id in cat_ids:
-            pair = (product_id, cat_id)
-            if pair not in seen_pairs:
-                m2m_rows.append(Through(product_id=product_id, category_id=cat_id))
-                seen_pairs.add(pair)
-
-    for i in range(0, len(m2m_rows), BATCH):
-        Through.objects.bulk_create(m2m_rows[i:i + BATCH], ignore_conflicts=True)
-
-    # ── STEP 5: Save upload log ───────────────────────────────────
     UploadLog.objects.create(
         retailer_name=retailer_name, filename=filename,
         loaded=loaded, skipped=skipped, total_found=total_found,
@@ -420,6 +457,7 @@ def category_stats(request):
         cats = Category.objects.filter(parent=parent).order_by('name')
         result = []
         for c in cats:
+            # Use M2M all_products — accurate because ancestors are stored too
             qs = c.all_products.all()
             if retailer_name:
                 qs = qs.filter(retailer__name=retailer_name)
@@ -479,7 +517,7 @@ def update_feed_url(request, retailer_id):
 
 
 # ─────────────────────────────────────────────
-# Refresh Feed  (OPTIMIZED — bulk update + cache)
+# Refresh Feed  (optimized with bulk insert + cache)
 # ─────────────────────────────────────────────
 
 @api_view(['POST'])
@@ -511,20 +549,12 @@ def refresh_feed(request, retailer_id):
     if not products:
         return Response({'error': 'No products found in feed'}, status=400)
 
-    # Fetch existing SKU → ID map for this retailer
-    existing_sku_map = dict(
-        Product.objects.filter(retailer=retailer).values_list('sku', 'id')
-    )
-
-    category_cache = {}
-    ancestor_cache = {}
-
-    to_create = []
-    to_update = []
-    m2m_data = []
-    skipped = 0
+    loaded = skipped = 0
     errors = []
     total_found = len(products)
+
+    cat_cache = {}
+    ancestor_cache = {}
 
     for product in products:
         try:
@@ -534,88 +564,41 @@ def refresh_feed(request, retailer_id):
                 continue
 
             primary_category = get_or_create_category_tree(
-                data['primary_category_parts'], category_cache
+                data['primary_category_parts'], cat_cache
+            )
+            all_cats = build_all_categories_with_ancestors(
+                data['all_category_parts'], cat_cache, ancestor_cache
             )
 
-            all_cat_ids = set()
-            for parts in data['all_category_parts']:
-                leaf = get_or_create_category_tree(parts, category_cache)
-                if leaf:
-                    for anc in get_ancestors_from_cache(leaf, ancestor_cache):
-                        all_cat_ids.add(anc.id)
-
-            product_fields = dict(
-                name=data['name'],
-                description=data['description'],
-                category=primary_category,
-                retailer=retailer,
-                brand=data['brand'],
-                price=data['price'],
-                sale_price=data['sale_price'],
-                currency=data['currency'],
-                stock=data['stock'],
-                source_url=data['source_url'],
-                image_url=data['image_url'],
-                additional_images=data['additional_images'],
-                colors=data['colors'],
-                sizes=data['sizes'],
-                is_active=True,
+            product_obj, _ = Product.objects.update_or_create(
+                sku=data['sku'],
+                defaults={
+                    'name': data['name'],
+                    'description': data['description'],
+                    'category': primary_category,
+                    'retailer': retailer,
+                    'brand': data['brand'],
+                    'price': data['price'],
+                    'sale_price': data['sale_price'],
+                    'currency': data['currency'],
+                    'stock': data['stock'],
+                    'source_url': data['source_url'],
+                    'image_url': data['image_url'],
+                    'additional_images': data['additional_images'],
+                    'colors': data['colors'],
+                    'sizes': data['sizes'],
+                    'is_active': True,
+                }
             )
 
-            if data['sku'] in existing_sku_map:
-                p = Product(id=existing_sku_map[data['sku']], sku=data['sku'], **product_fields)
-                to_update.append(p)
-            else:
-                to_create.append(Product(sku=data['sku'], **product_fields))
+            if all_cats:
+                product_obj.categories.set(all_cats)
 
-            m2m_data.append((data['sku'], list(all_cat_ids)))
+            loaded += 1
 
         except Exception as e:
             errors.append(str(e))
             skipped += 1
-
-    BATCH = 500
-
-    # Bulk create new
-    for i in range(0, len(to_create), BATCH):
-        Product.objects.bulk_create(to_create[i:i + BATCH], ignore_conflicts=True)
-
-    # Bulk update existing
-    update_fields = [
-        'name', 'description', 'category', 'brand', 'price', 'sale_price',
-        'currency', 'stock', 'source_url', 'image_url',
-        'additional_images', 'colors', 'sizes', 'is_active'
-    ]
-    for i in range(0, len(to_update), BATCH):
-        Product.objects.bulk_update(to_update[i:i + BATCH], update_fields)
-
-    loaded = len(to_create) + len(to_update)
-
-    # Refresh M2M
-    all_skus = [p.sku for p in to_create] + [p.sku for p in to_update]
-    sku_to_id = dict(Product.objects.filter(sku__in=all_skus).values_list('sku', 'id'))
-
-    Through = Product.categories.through
-
-    # Clear old M2M for updated products before re-inserting
-    updated_ids = [existing_sku_map[p.sku] for p in to_update if p.sku in existing_sku_map]
-    if updated_ids:
-        Through.objects.filter(product_id__in=updated_ids).delete()
-
-    m2m_rows = []
-    seen_pairs = set()
-    for sku, cat_ids in m2m_data:
-        product_id = sku_to_id.get(sku)
-        if not product_id:
-            continue
-        for cat_id in cat_ids:
-            pair = (product_id, cat_id)
-            if pair not in seen_pairs:
-                m2m_rows.append(Through(product_id=product_id, category_id=cat_id))
-                seen_pairs.add(pair)
-
-    for i in range(0, len(m2m_rows), BATCH):
-        Through.objects.bulk_create(m2m_rows[i:i + BATCH], ignore_conflicts=True)
 
     retailer.last_fetched_at = timezone.now()
     retailer.save()
@@ -634,4 +617,147 @@ def refresh_feed(request, retailer_id):
         'total_found': total_found,
         'last_fetched_at': retailer.last_fetched_at,
         'errors': errors[:5]
+    })
+
+
+# ─────────────────────────────────────────────
+# Analytics
+# ─────────────────────────────────────────────
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def analytics(request):
+    from django.db.models import Count, Avg, Min, Max, Q
+    from django.db.models.functions import TruncDate
+
+    # ── Product Analytics ─────────────────────
+    total_products = Product.objects.filter(is_active=True).count()
+    in_stock = Product.objects.filter(is_active=True, stock=1).count()
+    out_of_stock = Product.objects.filter(is_active=True, stock=0).count()
+    with_sale = Product.objects.filter(is_active=True, sale_price__isnull=False).count()
+    without_sale = total_products - with_sale
+
+    products_per_retailer = list(
+        Product.objects.filter(is_active=True)
+        .values('retailer__name')
+        .annotate(count=Count('id'))
+        .order_by('-count')
+    )
+
+    top_brands = list(
+        Product.objects.filter(is_active=True)
+        .exclude(brand='')
+        .values('brand')
+        .annotate(count=Count('id'))
+        .order_by('-count')[:10]
+    )
+
+    products_over_time = list(
+        Product.objects.filter(is_active=True)
+        .annotate(date=TruncDate('created_at'))
+        .values('date')
+        .annotate(count=Count('id'))
+        .order_by('date')
+    )
+    for p in products_over_time:
+        p['date'] = str(p['date'])
+
+    # ── Price Analytics ───────────────────────
+    avg_price_per_retailer = list(
+        Product.objects.filter(is_active=True)
+        .values('retailer__name', 'currency')
+        .annotate(avg_price=Avg('price'), min_price=Min('price'), max_price=Max('price'))
+        .order_by('-avg_price')
+    )
+    for r in avg_price_per_retailer:
+        r['avg_price'] = round(float(r['avg_price'] or 0), 2)
+        r['min_price'] = round(float(r['min_price'] or 0), 2)
+        r['max_price'] = round(float(r['max_price'] or 0), 2)
+
+    ranges = [
+        ('Under 500',   Q(price__lt=500)),
+        ('500-1000',    Q(price__gte=500,   price__lt=1000)),
+        ('1000-2000',   Q(price__gte=1000,  price__lt=2000)),
+        ('2000-5000',   Q(price__gte=2000,  price__lt=5000)),
+        ('5000-10000',  Q(price__gte=5000,  price__lt=10000)),
+        ('Above 10000', Q(price__gte=10000)),
+    ]
+    price_distribution = [
+        {'range': label, 'count': Product.objects.filter(is_active=True).filter(q).count()}
+        for label, q in ranges
+    ]
+
+    # ── Category Analytics ────────────────────
+    top_categories = list(
+        Product.objects.filter(is_active=True)
+        .exclude(category=None)
+        .values('category__name')
+        .annotate(count=Count('id'))
+        .order_by('-count')[:10]
+    )
+
+    category_availability = list(
+        Product.objects.filter(is_active=True)
+        .exclude(category=None)
+        .values('category__name')
+        .annotate(
+            total=Count('id'),
+            available=Count('id', filter=Q(stock=1))
+        )
+        .order_by('-total')[:10]
+    )
+    for c in category_availability:
+        c['availability_pct'] = round((c['available'] / c['total']) * 100, 1) if c['total'] else 0
+
+    # ── Upload Analytics ──────────────────────
+    total_uploads = UploadLog.objects.count()
+    successful_uploads = UploadLog.objects.filter(status='success').count()
+    failed_uploads = UploadLog.objects.filter(status='failed').count()
+    total_loaded = sum(UploadLog.objects.values_list('loaded', flat=True))
+    total_skipped = sum(UploadLog.objects.values_list('skipped', flat=True))
+
+    uploads_per_retailer = list(
+        UploadLog.objects.values('retailer_name')
+        .annotate(uploads=Count('id'))
+        .order_by('-uploads')
+    )
+
+    upload_timeline = list(
+        UploadLog.objects
+        .annotate(date=TruncDate('created_at'))
+        .values('date', 'retailer_name')
+        .annotate(loaded=Count('loaded'))
+        .order_by('date')
+    )
+    for u in upload_timeline:
+        u['date'] = str(u['date'])
+
+    return Response({
+        'product_analytics': {
+            'total_products': total_products,
+            'in_stock': in_stock,
+            'out_of_stock': out_of_stock,
+            'with_sale': with_sale,
+            'without_sale': without_sale,
+            'products_per_retailer': products_per_retailer,
+            'top_brands': top_brands,
+            'products_over_time': products_over_time,
+        },
+        'price_analytics': {
+            'avg_price_per_retailer': avg_price_per_retailer,
+            'price_distribution': price_distribution,
+        },
+        'category_analytics': {
+            'top_categories': top_categories,
+            'category_availability': category_availability,
+        },
+        'upload_analytics': {
+            'total_uploads': total_uploads,
+            'successful_uploads': successful_uploads,
+            'failed_uploads': failed_uploads,
+            'total_loaded': total_loaded,
+            'total_skipped': total_skipped,
+            'uploads_per_retailer': uploads_per_retailer,
+            'upload_timeline': upload_timeline,
+        }
     })
