@@ -793,390 +793,6 @@ def analytics(request):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def qa_data_quality(request):
-    from django.db.models import Q, Count
-
-    retailer_filter = request.query_params.get('retailer', None)
-    qs = Product.objects.filter(is_active=True).select_related('retailer', 'category')
-    if retailer_filter:
-        qs = qs.filter(retailer__name=retailer_filter)
-
-    total = qs.count()
-    if total == 0:
-        return Response({'error': 'No products found'}, status=400)
-
-    # ── Issue checks ──────────────────────────
-    missing_image      = qs.filter(Q(image_url='') | Q(image_url__isnull=True))
-    missing_desc       = qs.filter(Q(description='') | Q(description__isnull=True))
-    missing_brand      = qs.filter(Q(brand='') | Q(brand__isnull=True))
-    missing_category   = qs.filter(category__isnull=True)
-    missing_colors     = qs.filter(Q(colors='') | Q(colors__isnull=True))
-    missing_sizes      = qs.filter(Q(sizes='') | Q(sizes__isnull=True))
-    zero_price         = qs.filter(price__lte=0)
-    suspicious_price   = qs.filter(price__gt=500000)
-    bad_sale_price     = qs.filter(sale_price__isnull=False, sale_price__gte=models.F('price'))
-    out_of_stock       = qs.filter(stock=0)
-    missing_source_url = qs.filter(Q(source_url='') | Q(source_url__isnull=True))
-
-    def sample(queryset, n=5):
-        return list(queryset.values('id', 'sku', 'name', 'retailer__name', 'price', 'sale_price')[:n])
-
-    issues = [
-        {
-            'key': 'missing_image',
-            'label': 'Missing Image URL',
-            'severity': 'high',
-            'count': missing_image.count(),
-            'samples': sample(missing_image),
-        },
-        {
-            'key': 'missing_description',
-            'label': 'Missing Description',
-            'severity': 'medium',
-            'count': missing_desc.count(),
-            'samples': sample(missing_desc),
-        },
-        {
-            'key': 'missing_brand',
-            'label': 'Missing Brand',
-            'severity': 'medium',
-            'count': missing_brand.count(),
-            'samples': sample(missing_brand),
-        },
-        {
-            'key': 'missing_category',
-            'label': 'No Category Assigned',
-            'severity': 'high',
-            'count': missing_category.count(),
-            'samples': sample(missing_category),
-        },
-        {
-            'key': 'missing_colors',
-            'label': 'Missing Colors',
-            'severity': 'low',
-            'count': missing_colors.count(),
-            'samples': sample(missing_colors),
-        },
-        {
-            'key': 'missing_sizes',
-            'label': 'Missing Sizes',
-            'severity': 'low',
-            'count': missing_sizes.count(),
-            'samples': sample(missing_sizes),
-        },
-        {
-            'key': 'zero_price',
-            'label': 'Zero or Negative Price',
-            'severity': 'critical',
-            'count': zero_price.count(),
-            'samples': sample(zero_price),
-        },
-        {
-            'key': 'suspicious_price',
-            'label': 'Suspiciously High Price (> 5,00,000)',
-            'severity': 'high',
-            'count': suspicious_price.count(),
-            'samples': sample(suspicious_price),
-        },
-        {
-            'key': 'bad_sale_price',
-            'label': 'Sale Price >= Regular Price (data error)',
-            'severity': 'critical',
-            'count': bad_sale_price.count(),
-            'samples': sample(bad_sale_price),
-        },
-        {
-            'key': 'out_of_stock',
-            'label': 'Out of Stock Products',
-            'severity': 'low',
-            'count': out_of_stock.count(),
-            'samples': sample(out_of_stock),
-        },
-        {
-            'key': 'missing_source_url',
-            'label': 'Missing Source URL',
-            'severity': 'medium',
-            'count': missing_source_url.count(),
-            'samples': sample(missing_source_url),
-        },
-    ]
-
-    # ── Per-retailer quality scores ───────────
-    retailer_scores = []
-    for retailer in Retailer.objects.filter(is_active=True):
-        r_qs = qs.filter(retailer=retailer)
-        r_total = r_qs.count()
-        if r_total == 0:
-            continue
-
-        critical_issues = (
-            r_qs.filter(Q(image_url='') | Q(image_url__isnull=True)).count() +
-            r_qs.filter(price__lte=0).count() +
-            r_qs.filter(category__isnull=True).count()
-        )
-        score = round(max(0, 100 - (critical_issues / r_total * 100)), 1)
-        retailer_scores.append({
-            'retailer': retailer.name,
-            'total': r_total,
-            'score': score,
-            'critical_issues': critical_issues,
-        })
-
-    retailer_scores.sort(key=lambda x: x['score'])
-
-    # ── Summary ───────────────────────────────
-    total_issues = sum(i['count'] for i in issues if i['severity'] in ['critical', 'high'])
-    overall_score = round(max(0, 100 - (total_issues / total * 100)), 1)
-
-    return Response({
-        'summary': {
-            'total_products': total,
-            'overall_score': overall_score,
-            'total_issue_count': sum(i['count'] for i in issues),
-            'critical_count': sum(i['count'] for i in issues if i['severity'] == 'critical'),
-            'high_count':     sum(i['count'] for i in issues if i['severity'] == 'high'),
-            'medium_count':   sum(i['count'] for i in issues if i['severity'] == 'medium'),
-            'low_count':      sum(i['count'] for i in issues if i['severity'] == 'low'),
-        },
-        'issues': issues,
-        'retailer_scores': retailer_scores,
-    })
-
-
-# ─────────────────────────────────────────────
-# QA — XML Feed Validator (dry run, no DB save)
-# ─────────────────────────────────────────────
-
-@api_view(['POST'])
-@permission_classes([IsAuthenticated])
-@parser_classes([MultiPartParser])
-def qa_validate_feed(request):
-    file = request.FILES.get('file')
-    if not file:
-        return Response({'error': 'No file uploaded'}, status=400)
-
-    try:
-        xml_data = file.read()
-        root = ET.fromstring(xml_data)
-    except ET.ParseError as e:
-        return Response({'error': f'Invalid XML: {str(e)}'}, status=400)
-
-    products = [root] if root.tag == 'Product' else root.findall('Product')
-    if not products:
-        return Response({'error': 'No <Product> elements found in XML'}, status=400)
-
-    total = len(products)
-    issues = []
-    parsed_previews = []
-
-    counts = {
-        'missing_sku': 0,
-        'missing_name': 0,
-        'missing_price': 0,
-        'zero_price': 0,
-        'missing_image': 0,
-        'missing_category': 0,
-        'missing_description': 0,
-        'missing_brand': 0,
-        'missing_colors': 0,
-        'missing_sizes': 0,
-        'bad_sale_price': 0,
-        'duplicate_sku': 0,
-        'parse_errors': 0,
-    }
-    seen_skus = set()
-
-    for i, product in enumerate(products):
-        row_issues = []
-        product_num = i + 1
-
-        try:
-            # SKU
-            sku = ''
-            variant = product.find('Variant')
-            if variant is not None:
-                sku_el = variant.find('SKU')
-                if sku_el is not None and sku_el.text:
-                    sku = sku_el.text.strip()
-            if not sku:
-                pid = product.find('ProductId')
-                if pid is not None and pid.text:
-                    sku = pid.text.strip()
-            if not sku:
-                counts['missing_sku'] += 1
-                row_issues.append('Missing SKU')
-            elif sku in seen_skus:
-                counts['duplicate_sku'] += 1
-                row_issues.append(f'Duplicate SKU: {sku}')
-            else:
-                seen_skus.add(sku)
-
-            # Name
-            name = ''
-            for tag in ['n', 'Name', 'ProductName', 'Title']:
-                el = product.find(tag)
-                if el is not None and el.text and el.text.strip():
-                    name = el.text.strip()
-                    break
-            if not name:
-                counts['missing_name'] += 1
-                row_issues.append('Missing name')
-
-            # Price — scan ALL variants for first valid price
-            price_str = ''
-            all_variants_v = product.findall('Variant')
-            for v in all_variants_v:
-                v_p = v.findtext('Price') or ''
-                if v_p.strip():
-                    price_str = v_p.strip()
-                    break
-            if not price_str:
-                raw = product.findtext('Price') or ''
-                price_str = raw.split(' - ')[0].strip() if ' - ' in raw else raw.strip()
-            if not price_str:
-                counts['missing_price'] += 1
-                row_issues.append('Missing price')
-            else:
-                try:
-                    price_val = float(re.sub(r'[^\d.]', '', price_str.replace(',', '.')))
-                    if price_val <= 0:
-                        counts['zero_price'] += 1
-                        row_issues.append(f'Zero/negative price: {price_str}')
-                except Exception:
-                    row_issues.append(f'Unparseable price: {price_str}')
-
-            # Sale price check — scan all variants for first valid sale price
-            sale_str = ''
-            for v in all_variants_v:
-                v_sp = v.findtext('SalePrice') or v.findtext('Sale_Price') or ''
-                if v_sp.strip():
-                    sale_str = v_sp.strip()
-                    break
-            if not sale_str:
-                raw_s = product.findtext('SalePrice') or product.findtext('Sale_Price') or ''
-                sale_str = raw_s.split(' - ')[0].strip() if ' - ' in raw_s else raw_s.strip()
-            if sale_str and price_str:
-                try:
-                    sp_val = float(re.sub(r'[^\d.]', '', sale_str.replace(',', '.')))
-                    p_val  = float(re.sub(r'[^\d.]', '', price_str.replace(',', '.')))
-                    if sp_val >= p_val:
-                        counts['bad_sale_price'] += 1
-                        row_issues.append(f'Sale price ({sale_str}) >= regular price ({price_str})')
-                except Exception:
-                    pass
-
-            # Image
-            img = ''
-            for tag in ['ImageURL', 'Image', 'MainImage']:
-                el = product.find(tag)
-                if el is not None and el.text and el.text.strip():
-                    img = el.text.strip()
-                    break
-            if not img:
-                color_el = product.find('Color')
-                if color_el is not None:
-                    img_el = color_el.find('ImageURL')
-                    if img_el is not None and img_el.text:
-                        img = img_el.text.strip()
-            if not img:
-                counts['missing_image'] += 1
-                row_issues.append('Missing image URL')
-
-            # Category
-            cats = product.findall('Category')
-            if not cats:
-                counts['missing_category'] += 1
-                row_issues.append('Missing category')
-
-            # Description
-            desc = ''
-            for tag in ['Description', 'ProductDescription', 'Desc']:
-                el = product.find(tag)
-                if el is not None and el.text and el.text.strip():
-                    desc = el.text.strip()
-                    break
-            if not desc:
-                counts['missing_description'] += 1
-                row_issues.append('Missing description')
-
-            # Brand
-            brand = ''
-            for tag in ['Brand', 'BrandName', 'Manufacturer']:
-                el = product.find(tag)
-                if el is not None and el.text and el.text.strip():
-                    brand = el.text.strip()
-                    break
-            if not brand:
-                counts['missing_brand'] += 1
-                row_issues.append('Missing brand')
-
-            # Colors
-            colors = [c.find('n').text for c in product.findall('Color')
-                      if c.find('n') is not None and c.find('n').text]
-            if not colors:
-                counts['missing_colors'] += 1
-
-            # Sizes
-            sizes = [s.text for s in product.findall('Size') if s.text]
-            if not sizes:
-                counts['missing_sizes'] += 1
-
-            # Build preview for first 10 valid products
-            if len(parsed_previews) < 10:
-                parsed_previews.append({
-                    'index': product_num,
-                    'sku': sku or '—',
-                    'name': (name[:60] + '…') if len(name) > 60 else name or '—',
-                    'price': price_str or '—',
-                    'sale_price': sale_str or '—',
-                    'brand': brand or '—',
-                    'image': '✅' if img else '❌',
-                    'category': '✅' if cats else '❌',
-                    'colors': ', '.join(colors[:3]) or '—',
-                    'sizes': ', '.join(sizes[:4]) or '—',
-                    'issues': row_issues,
-                })
-
-            if row_issues:
-                issues.append({
-                    'product_num': product_num,
-                    'sku': sku or '—',
-                    'name': (name[:50] + '…') if len(name) > 50 else name or '—',
-                    'issues': row_issues,
-                })
-
-        except Exception as e:
-            counts['parse_errors'] += 1
-            issues.append({
-                'product_num': product_num,
-                'sku': '—',
-                'name': '—',
-                'issues': [f'Parse error: {str(e)}'],
-            })
-
-    clean_products = total - len(set(i['product_num'] for i in issues))
-    quality_score = round((clean_products / total) * 100, 1) if total else 0
-
-    return Response({
-        'summary': {
-            'total_products': total,
-            'clean_products': clean_products,
-            'products_with_issues': total - clean_products,
-            'quality_score': quality_score,
-            'unique_skus': len(seen_skus),
-        },
-        'counts': counts,
-        'issues': issues[:100],   # cap at 100 to keep response small
-        'preview': parsed_previews,
-    })
-
-
-# ─────────────────────────────────────────────
-# QA — Data Quality Report
-# ─────────────────────────────────────────────
-
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def qa_data_quality(request):
     from django.db.models import Count, Q
 
     retailer_filter = request.GET.get('retailer', None)
@@ -1339,16 +955,17 @@ def qa_validate_feed(request):
         else:
             issues.append('Missing name')
 
-        # Price
+        # Price — scan ALL variants for first valid price
         price_raw = ''
-        if variant is not None:
-            pr = variant.find('Price')
-            if pr is not None and pr.text:
-                price_raw = pr.text.strip()
+        all_vars = p.findall('Variant')
+        for v in all_vars:
+            vp = v.findtext('Price') or ''
+            if vp.strip():
+                price_raw = vp.strip()
+                break
         if not price_raw:
-            pr = p.find('Price')
-            if pr is not None and pr.text:
-                price_raw = pr.text.strip()
+            raw = p.findtext('Price') or ''
+            price_raw = raw.split(' - ')[0].strip() if ' - ' in raw else raw.strip()
 
         if price_raw:
             field_counts['has_price'] += 1
@@ -1357,12 +974,16 @@ def qa_validate_feed(request):
                 if price_val == 0:
                     zero_price_count += 1
                     issues.append('Zero price')
-                # Check sale price
+                # Check sale price — scan all variants
                 sale_raw = ''
-                if variant is not None:
-                    sp = variant.find('SalePrice')
-                    if sp is not None and sp.text:
-                        sale_raw = sp.text.strip()
+                for v in all_vars:
+                    vsp = v.findtext('SalePrice') or v.findtext('Sale_Price') or ''
+                    if vsp.strip():
+                        sale_raw = vsp.strip()
+                        break
+                if not sale_raw:
+                    raw_s = p.findtext('SalePrice') or p.findtext('Sale_Price') or ''
+                    sale_raw = raw_s.split(' - ')[0].strip() if ' - ' in raw_s else raw_s.strip()
                 if sale_raw:
                     sale_val = parse_price(sale_raw)
                     if sale_val >= price_val:
@@ -1374,9 +995,22 @@ def qa_validate_feed(request):
         else:
             issues.append('Missing price')
 
-        # Image
-        img_el = p.find('ImageURL') or p.find('Image')
-        if img_el is not None and img_el.text and img_el.text.strip():
+        # Image — check PrimaryImageURL, ImageURL, Image, or inside <Color>
+        img = ''
+        for img_tag in ['PrimaryImageURL', 'ImageURL', 'Image', 'MainImage']:
+            el = p.find(img_tag)
+            if el is not None and el.text and el.text.strip():
+                img = el.text.strip()
+                break
+        if not img:
+            color_el = p.find('Color')
+            if color_el is not None:
+                for img_tag in ['ImageURL', 'PrimaryImageURL']:
+                    el = color_el.find(img_tag)
+                    if el is not None and el.text and el.text.strip():
+                        img = el.text.strip()
+                        break
+        if img:
             field_counts['has_image'] += 1
         else:
             issues.append('Missing image URL')
@@ -1389,8 +1023,13 @@ def qa_validate_feed(request):
             issues.append('Missing or very short description')
 
         # Brand
-        brand_el = p.find('Brand') or p.find('Manufacturer')
-        if brand_el is not None and brand_el.text and brand_el.text.strip():
+        brand = ''
+        for tag in ['Brand', 'BrandName', 'Manufacturer']:
+            el = p.find(tag)
+            if el is not None and el.text and el.text.strip():
+                brand = el.text.strip()
+                break
+        if brand:
             field_counts['has_brand'] += 1
         else:
             issues.append('Missing brand')
@@ -1402,16 +1041,33 @@ def qa_validate_feed(request):
         else:
             issues.append('Missing category')
 
-        # Stock
-        stock_el = p.find('StockIndicator') or p.find('Stock')
-        if stock_el is not None and stock_el.text:
+        # Stock — check <StockIndicator> at product level OR <Available> inside Variant
+        stock_found = False
+        for tag in ['StockIndicator', 'Stock', 'InStock']:
+            el = p.find(tag)
+            if el is not None and el.text and el.text.strip():
+                stock_found = True
+                break
+        if not stock_found:
+            for v in p.findall('Variant'):
+                for tag in ['Available', 'InStock']:
+                    el = v.find(tag)
+                    if el is not None and el.text and el.text.strip():
+                        stock_found = True
+                        break
+                if stock_found:
+                    break
+        if stock_found:
             field_counts['has_stock'] += 1
         else:
             issues.append('Missing stock indicator')
 
-        # Colors
-        colors = [c.find('n').text.strip() for c in p.findall('Color')
-                  if c.find('n') is not None and c.find('n').text]
+        # Colors — check <Color><n> or <Color><Name>
+        colors = []
+        for c in p.findall('Color'):
+            cn = c.find('n') or c.find('Name')
+            if cn is not None and cn.text and cn.text.strip():
+                colors.append(cn.text.strip())
         if colors:
             field_counts['has_colors'] += 1
 
@@ -1434,7 +1090,7 @@ def qa_validate_feed(request):
                 'sku': sku,
                 'name': name,
                 'price': price_raw,
-                'brand': (brand_el.text.strip() if brand_el is not None and brand_el.text else ''),
+                'brand': brand or '—',
                 'category': ' > '.join(
                     [part.text.strip() for part in (cat_els[0].findall('Part') if cat_els else []) if part.text]
                 ) if cat_els else '',
