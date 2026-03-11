@@ -35,11 +35,23 @@ A production-ready **Django REST API + FastAPI microservice** for ingesting, man
 - Strips HTML entities from descriptions (&#243; → ó)
 - Deduplicates by SKU on re-upload
 
-### 🗂️ Hierarchical Categories
-- Full **parent → child category tree** built from XML feed Parts
-- Supports Top → Mid → Sub → Leaf levels
+### ⚡ Bulk Upload Optimization (99% Query Reduction)
+- **Pre-loads all existing SKUs** into a Python `set` — O(1) memory lookup vs DB query per product
+- **In-memory category cache** — same category path never hits DB twice within an upload
+- **In-memory ancestor cache** — category ancestor chain computed once per category ID
+- **`bulk_create` in batches of 500** — one SQL INSERT per 500 products
+- **M2M junction table bulk_create** — categories linked in a single query per batch
+- Result: **210,000 queries → ~200 queries | 15 minutes → 30 seconds** for 7,000 products
+
+### 🗂️ Hierarchical Categories with ManyToMany
+- Full **parent → child category tree** built from XML feed parts
+- Supports Top → Mid → Sub → Leaf levels (self-referential FK)
 - `unique_together` constraint on name + parent
-- Tree statistics with product counts per node and all descendants
+- **ManyToMany (M2M) relationship** — every product is linked to its leaf category **AND all ancestor categories**
+  - Example: Lipstick → linked to [Lip, Makeup, Beauty, Woman, New In]
+  - Ensures accurate product counts at every tree level
+- Tree statistics with accurate product counts using M2M `all_products` related name
+- Supports **retailer filter** — shows only categories with products for that retailer
 
 ### 🔍 FastAPI Search Microservice
 - Separate microservice on port 8001
@@ -47,6 +59,14 @@ A production-ready **Django REST API + FastAPI microservice** for ingesting, man
 - Filter by: retailer, brand, color, size, min/max price, in-stock
 - `/search` endpoint — returns up to 500 results
 - `/filters` endpoint — returns available filter options for UI dropdowns
+
+### 📈 Analytics Dashboard
+- Single `/api/analytics/` endpoint returning all insights in one call
+- **Product Analytics:** total products, in-stock vs out-of-stock, products per retailer, top 10 brands, products uploaded over time
+- **Price Analytics:** avg/min/max price per retailer, price range distribution (6 buckets)
+- **Category Analytics:** top 10 categories by product count, availability % per category
+- **Upload Analytics:** total uploads, success/fail counts, products loaded vs skipped, uploads per retailer
+- Uses Django ORM aggregations: `Count`, `Avg`, `Min`, `Max`, `TruncDate`, `Q` objects
 
 ### 📋 Activity Log
 - Every XML upload logged to `UploadLog` model
@@ -72,9 +92,9 @@ ecommerce_api/
 │   ├── settings.py
 │   └── urls.py
 ├── products/
-│   ├── models.py          # Retailer, Category (hierarchical), Product, UploadLog
+│   ├── models.py          # Retailer, Category (hierarchical + M2M), Product, UploadLog
 │   ├── serializers.py
-│   ├── views.py           # All API views + XML parser
+│   ├── views.py           # All API views + optimized XML parser + analytics
 │   └── urls.py
 ├── fastapi_search/
 │   └── main.py            # FastAPI search + filters endpoints
@@ -91,15 +111,19 @@ ecommerce_api/
 name, slug, website, feed_url, last_fetched_at, is_active, created_at
 ```
 
-### Category (Hierarchical)
+### Category (Hierarchical — Self-Referential FK)
 ```python
-name, slug, parent (FK self), level (0=Top, 1=Mid, 2=Sub, 3=Leaf)
+name, slug, parent (FK → self, nullable), level (0=Top, 1=Mid, 2=Sub, 3=Leaf)
+# unique_together: [name, parent]
 ```
 
 ### Product
 ```python
-sku (indexed), name, description, category (FK), retailer (FK CASCADE),
-brand, price (indexed), sale_price, currency, stock,
+sku (unique, indexed), name, description
+category (FK → Category, SET_NULL)          # primary display category
+categories (ManyToManyField → Category)     # ALL categories + ancestors
+retailer (FK → Retailer, CASCADE)
+brand, price (indexed), sale_price, currency, stock
 source_url, image_url, additional_images, colors, sizes, is_active
 ```
 
@@ -120,15 +144,15 @@ POST   /api/token/refresh/      # Refresh access token
 
 ### Products
 ```
-GET    /api/products/           # List all products
+GET    /api/products/           # List all active products
 POST   /api/bulk-delete/        # Bulk delete by ID list
 ```
 
 ### Categories
 ```
-GET    /api/categories/         # Flat list
-GET    /api/category-stats/     # Hierarchical tree with product counts
-GET    /api/category-stats/?retailer=Westside IN   # Filter by retailer
+GET    /api/categories/                            # Flat list
+GET    /api/category-stats/                        # Hierarchical tree with product counts
+GET    /api/category-stats/?retailer=Westside IN   # Filter tree by retailer
 ```
 
 ### Retailers
@@ -147,6 +171,11 @@ POST   /api/upload-xml/         # Upload XML file (multipart/form-data)
 ### Activity Log
 ```
 GET    /api/upload-logs/        # All upload history
+```
+
+### Analytics
+```
+GET    /api/analytics/          # All analytics: products, price, categories, uploads
 ```
 
 ### FastAPI Search (port 8001)
@@ -224,14 +253,31 @@ uvicorn fastapi_search.main:app --reload --port 8001
 ---
 
 ## 📊 Data Stats
-- **real products** across multiple retailers
-- **categories** in hierarchical tree
+- **11,500+ real products** across multiple international retailers
+- **150+ categories** in hierarchical tree
 - Supports **unlimited retailers** — just upload a new XML feed
 - Multi-currency support: ₹, £, €, ₩, $, and 20+ more
+
+---
+
+## 💡 Key Technical Decisions
+
+| Decision | Reason |
+|---|---|
+| Dual backend (Django + FastAPI) | Django for CRUD/auth, FastAPI for fast search queries |
+| Self-referential FK on Category | Build unlimited depth tree without extra tables |
+| ManyToMany product↔category | Accurate counts at every tree level including ancestors |
+| bulk_create in batches of 500 | One SQL INSERT per 500 rows — 99% fewer queries |
+| In-memory category + ancestor cache | Same category path never re-queried within an upload |
+| Pre-load SKUs to Python set | O(1) deduplication check per product — no DB query needed |
+| CASCADE on Retailer→Product | Deleting a retailer auto-deletes all their products |
+| SET_NULL on Category→Product | Deleting a category keeps products safe |
+| update_or_create in refresh_feed | Re-running feed never creates duplicates |
 
 ---
 
 ## 👨‍💻 Author
 **Mahesh Mokashe**
 - GitHub: [@Maheshmokashe](https://github.com/Maheshmokashe)
-- Experience: 3.7 years at KrawlNet Technologies
+- LinkedIn: [linkedin.com/in/mahesh-mokashe1997](https://linkedin.com/in/mahesh-mokashe1997)
+- Experience: 3.8 years at KrawlNet Technologies
