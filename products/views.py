@@ -1157,7 +1157,7 @@ def qa_fix_suggestions(request):
             'affected': no_brand.count(), 'pct': round(no_brand.count() / total * 100, 1),
             'title': 'Missing Brand',
             'suggestion': f'Consider using the retailer name as brand (e.g. "{sample_retailer}"), or extract brand from the first word of product name.',
-            'samples': list(no_brand.values('sku', 'name', 'retailer__name')[:5]),
+            'samples': list(no_brand.values('sku', 'name', 'retailer__name', 'source_url')[:5]),
         })
 
     no_image = qs.filter(Q(image_url='') | Q(image_url__isnull=True))
@@ -1166,8 +1166,8 @@ def qa_fix_suggestions(request):
             'field': 'image_url', 'icon': '🖼️', 'severity': 'high',
             'affected': no_image.count(), 'pct': round(no_image.count() / total * 100, 1),
             'title': 'Missing Image URL',
-            'suggestion': 'Check if the XML feed  & product page have image URLS.',
-            'samples': list(no_image.values('sku', 'name', 'retailer__name')[:5]),
+            'suggestion': 'Check if the XML feed uses a different tag: <ImageURL>, <Image>, <PrimaryImageURL>, or inside <Color><ImageURL>.',
+            'samples': list(no_image.values('sku', 'name', 'retailer__name', 'source_url')[:5]),
         })
 
     no_desc = qs.filter(Q(description='') | Q(description__isnull=True))
@@ -1177,7 +1177,7 @@ def qa_fix_suggestions(request):
             'affected': no_desc.count(), 'pct': round(no_desc.count() / total * 100, 1),
             'title': 'Missing Description',
             'suggestion': 'Products with "Not Available" description are saved as empty. Consider using product name + category as a fallback description.',
-            'samples': list(no_desc.values('sku', 'name', 'retailer__name')[:5]),
+            'samples': list(no_desc.values('sku', 'name', 'retailer__name', 'source_url')[:5]),
         })
 
     zero_price = qs.filter(price__lte=0)
@@ -1186,8 +1186,8 @@ def qa_fix_suggestions(request):
             'field': 'price', 'icon': '💰', 'severity': 'critical',
             'affected': zero_price.count(), 'pct': round(zero_price.count() / total * 100, 1),
             'title': 'Zero or Missing Price',
-            'suggestion': "Price is ₹0 — variant's <Price> tag was likely empty. Check if price is available on the product page.",
-            'samples': list(zero_price.values('sku', 'name', 'retailer__name', 'price')[:5]),
+            'suggestion': "Price is ₹0 — variant's <Price> tag was likely empty. Check if price is inside <Variant> or at product level as a range like '₹999 - ₹1999'.",
+            'samples': list(zero_price.values('sku', 'name', 'retailer__name', 'price', 'source_url')[:5]),
         })
 
     no_cat = qs.filter(category__isnull=True)
@@ -1196,8 +1196,8 @@ def qa_fix_suggestions(request):
             'field': 'category', 'icon': '🗂️', 'severity': 'high',
             'affected': no_cat.count(), 'pct': round(no_cat.count() / total * 100, 1),
             'title': 'No Category Assigned',
-            'suggestion': 'Products have no <Category><Part> elements in the feed. They are saved as Uncategorized. Check the site categories.',
-            'samples': list(no_cat.values('sku', 'name', 'retailer__name')[:5]),
+            'suggestion': 'Products have no <Category><Part> elements in the feed. They are saved as Uncategorized. Ask the retailer to include category hierarchy.',
+            'samples': list(no_cat.values('sku', 'name', 'retailer__name', 'source_url')[:5]),
         })
 
     no_colors = qs.filter(Q(colors='') | Q(colors__isnull=True))
@@ -1206,8 +1206,8 @@ def qa_fix_suggestions(request):
             'field': 'colors', 'icon': '🎨', 'severity': 'low',
             'affected': no_colors.count(), 'pct': round(no_colors.count() / total * 100, 1),
             'title': 'Missing Colors',
-            'suggestion': 'Color name not found in <Color><n> or <Color><Name> tags. Check if product has color or not.',
-            'samples': list(no_colors.values('sku', 'name', 'retailer__name')[:5]),
+            'suggestion': 'Color name not found in <Color><n> or <Color><Name> tags. Check if feed uses <ColorName> or <Colour>.',
+            'samples': list(no_colors.values('sku', 'name', 'retailer__name', 'source_url')[:5]),
         })
 
     no_sizes = qs.filter(Q(sizes='') | Q(sizes__isnull=True))
@@ -1217,7 +1217,7 @@ def qa_fix_suggestions(request):
             'affected': no_sizes.count(), 'pct': round(no_sizes.count() / total * 100, 1),
             'title': 'Missing Sizes',
             'suggestion': 'No <Size> tags found at product level. Sizes might be inside <Variant><Size> instead.',
-            'samples': list(no_sizes.values('sku', 'name', 'retailer__name')[:5]),
+            'samples': list(no_sizes.values('sku', 'name', 'retailer__name', 'source_url')[:5]),
         })
 
     bad_sale = qs.filter(sale_price__isnull=False, sale_price__gte=models.F('price'))
@@ -1226,8 +1226,8 @@ def qa_fix_suggestions(request):
             'field': 'sale_price', 'icon': '🔄', 'severity': 'critical',
             'affected': bad_sale.count(), 'pct': round(bad_sale.count() / total * 100, 1),
             'title': 'Sale Price >= Regular Price',
-            'suggestion': 'Sale price should always be lower than regular price. This is a data entry error in the retailer feed. ',
-            'samples': list(bad_sale.values('sku', 'name', 'retailer__name', 'price', 'sale_price')[:5]),
+            'suggestion': 'Sale price should always be lower than regular price. This is a data entry error in the retailer system — flag it to the retailer.',
+            'samples': list(bad_sale.values('sku', 'name', 'retailer__name', 'price', 'sale_price', 'source_url')[:5]),
         })
 
     suggestions.sort(key=lambda x: {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}[x['severity']])
