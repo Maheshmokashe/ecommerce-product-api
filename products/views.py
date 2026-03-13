@@ -3,7 +3,7 @@ from rest_framework.permissions import IsAuthenticated, IsAdminUser
 from rest_framework.decorators import api_view, permission_classes, parser_classes
 from rest_framework.parsers import MultiPartParser
 from rest_framework.response import Response
-from .models import Product, Category, Retailer, UploadLog
+from .models import Product, Category, Retailer, UploadLog, PriceHistory
 from .serializers import ProductSerializer, CategorySerializer, RetailerSerializer, UploadLogSerializer
 from urllib.parse import urlparse
 from django.db import models
@@ -593,7 +593,7 @@ def refresh_feed(request, retailer_id):
                 data['all_category_parts'], cat_cache, ancestor_cache
             )
 
-            product_obj, _ = Product.objects.update_or_create(
+            product_obj, was_created = Product.objects.update_or_create(
                 sku=data['sku'],
                 defaults={
                     'name': data['name'],
@@ -613,6 +613,9 @@ def refresh_feed(request, retailer_id):
                     'is_active': True,
                 }
             )
+
+            # ── Price snapshot ───────────────────
+            snapshot_price_change(product_obj, data, was_created)
 
             if all_cats:
                 product_obj.categories.set(all_cats)
@@ -1419,3 +1422,152 @@ def qa_upload_flags(request):
             'has_critical': any(f['type'] == 'critical' for f in flags),
         })
     return Response({'upload_flags': flagged})
+
+
+# ─────────────────────────────────────────────
+# Price History — snapshot helper
+# ─────────────────────────────────────────────
+
+def snapshot_price_change(product_obj, new_data, was_created):
+    """
+    Called after every update_or_create in refresh_feed.
+    Compares old price vs new price and writes a PriceHistory row if anything changed.
+    """
+    from decimal import Decimal
+
+    new_price      = Decimal(str(new_data['price']))
+    new_sale       = Decimal(str(new_data['sale_price'])) if new_data['sale_price'] else None
+    old_price      = product_obj.price
+    old_sale       = product_obj.sale_price
+    currency       = new_data.get('currency', '₹')
+    sku            = new_data['sku']
+    product_name   = new_data['name']
+    retailer_name  = product_obj.retailer.name if product_obj.retailer else ''
+    source_url     = new_data.get('source_url', '')
+
+    entries = []
+
+    if was_created:
+        entries.append(PriceHistory(
+            sku=sku, product_name=product_name, retailer_name=retailer_name,
+            source_url=source_url, old_price=None, new_price=new_price,
+            old_sale_price=None, new_sale_price=new_sale,
+            change_type='new_product', change_pct=None, currency=currency,
+        ))
+    else:
+        # Regular price changed
+        if old_price is not None and new_price != old_price:
+            pct = round((float(new_price) - float(old_price)) / float(old_price) * 100, 2) if old_price else None
+            entries.append(PriceHistory(
+                sku=sku, product_name=product_name, retailer_name=retailer_name,
+                source_url=source_url, old_price=old_price, new_price=new_price,
+                old_sale_price=old_sale, new_sale_price=new_sale,
+                change_type='price_up' if new_price > old_price else 'price_down',
+                change_pct=pct, currency=currency,
+            ))
+
+        # Sale price changes (independent of regular price)
+        if old_sale is None and new_sale is not None:
+            entries.append(PriceHistory(
+                sku=sku, product_name=product_name, retailer_name=retailer_name,
+                source_url=source_url, old_price=old_price, new_price=new_price,
+                old_sale_price=None, new_sale_price=new_sale,
+                change_type='sale_added', change_pct=None, currency=currency,
+            ))
+        elif old_sale is not None and new_sale is None:
+            entries.append(PriceHistory(
+                sku=sku, product_name=product_name, retailer_name=retailer_name,
+                source_url=source_url, old_price=old_price, new_price=new_price,
+                old_sale_price=old_sale, new_sale_price=None,
+                change_type='sale_removed', change_pct=None, currency=currency,
+            ))
+        elif old_sale is not None and new_sale is not None and old_sale != new_sale:
+            entries.append(PriceHistory(
+                sku=sku, product_name=product_name, retailer_name=retailer_name,
+                source_url=source_url, old_price=old_price, new_price=new_price,
+                old_sale_price=old_sale, new_sale_price=new_sale,
+                change_type='sale_changed', change_pct=None, currency=currency,
+            ))
+
+    if entries:
+        PriceHistory.objects.bulk_create(entries)
+
+
+# ─────────────────────────────────────────────
+# QA — Price Change History
+# ─────────────────────────────────────────────
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def qa_price_changes(request):
+    from django.db.models import Q
+
+    retailer_filter = request.GET.get('retailer', None)
+    change_type     = request.GET.get('change_type', None)   # price_up, price_down, sale_added...
+    days            = int(request.GET.get('days', 30))
+    page            = int(request.GET.get('page', 1))
+    page_size       = 50
+
+    from django.utils import timezone
+    import datetime
+    since = timezone.now() - datetime.timedelta(days=days)
+
+    qs = PriceHistory.objects.filter(detected_at__gte=since)
+
+    if retailer_filter:
+        qs = qs.filter(retailer_name=retailer_filter)
+    if change_type:
+        qs = qs.filter(change_type=change_type)
+
+    # Summary counts
+    total       = qs.count()
+    price_ups   = qs.filter(change_type='price_up').count()
+    price_downs = qs.filter(change_type='price_down').count()
+    sale_added  = qs.filter(change_type='sale_added').count()
+    sale_removed= qs.filter(change_type='sale_removed').count()
+    new_products= qs.filter(change_type='new_product').count()
+
+    # Biggest price jumps
+    biggest_increases = list(
+        qs.filter(change_type='price_up')
+        .order_by('-change_pct')[:5]
+        .values('sku', 'product_name', 'retailer_name', 'old_price', 'new_price', 'change_pct', 'currency', 'source_url', 'detected_at')
+    )
+    biggest_decreases = list(
+        qs.filter(change_type='price_down')
+        .order_by('change_pct')[:5]
+        .values('sku', 'product_name', 'retailer_name', 'old_price', 'new_price', 'change_pct', 'currency', 'source_url', 'detected_at')
+    )
+
+    # Paginated full list
+    offset = (page - 1) * page_size
+    records = list(
+        qs.order_by('-detected_at')[offset:offset + page_size]
+        .values('sku', 'product_name', 'retailer_name', 'old_price', 'new_price',
+                'old_sale_price', 'new_sale_price', 'change_type', 'change_pct',
+                'currency', 'source_url', 'detected_at')
+    )
+
+    # Convert decimals and datetimes to strings for JSON
+    def fmt(r):
+        r['old_price']      = str(r['old_price']) if r['old_price'] is not None else None
+        r['new_price']      = str(r['new_price'])
+        r['old_sale_price'] = str(r['old_sale_price']) if r['old_sale_price'] is not None else None
+        r['new_sale_price'] = str(r['new_sale_price']) if r['new_sale_price'] is not None else None
+        r['change_pct']     = float(r['change_pct']) if r['change_pct'] is not None else None
+        r['detected_at']    = str(r['detected_at'])[:19]
+        return r
+
+    return Response({
+        'summary': {
+            'total': total, 'price_ups': price_ups, 'price_downs': price_downs,
+            'sale_added': sale_added, 'sale_removed': sale_removed, 'new_products': new_products,
+        },
+        'biggest_increases': [fmt(r) for r in biggest_increases],
+        'biggest_decreases': [fmt(r) for r in biggest_decreases],
+        'records': [fmt(r) for r in records],
+        'total_records': total,
+        'page': page,
+        'page_size': page_size,
+        'total_pages': max(1, (total + page_size - 1) // page_size),
+    })
