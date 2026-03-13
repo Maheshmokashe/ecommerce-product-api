@@ -60,8 +60,9 @@ class UploadLog(models.Model):
     total_found = models.IntegerField(default=0)
     status = models.CharField(max_length=20, default='success')
     error_message = models.TextField(blank=True, default='')
-    uploaded_by = models.CharField(max_length=100, blank=True, default='')
-    created_at = models.DateTimeField(auto_now_add=True)
+    uploaded_by      = models.CharField(max_length=100, blank=True, default='')
+    duration_seconds = models.FloatField(null=True, blank=True)
+    created_at       = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         ordering = ['-created_at']

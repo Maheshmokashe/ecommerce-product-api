@@ -305,6 +305,8 @@ def upload_xml(request):
 
     filename = file.name
     uploaded_by = request.user.username
+    import time as _time
+    _start = _time.time()
 
     try:
         tree = ET.parse(file)
@@ -453,7 +455,8 @@ def upload_xml(request):
         retailer_name=retailer_name, filename=filename,
         loaded=loaded, skipped=skipped, total_found=total_found,
         status='success', error_message=', '.join(errors[:3]),
-        uploaded_by=uploaded_by
+        uploaded_by=uploaded_by,
+        duration_seconds=round(_time.time() - _start, 2)
     )
 
     return Response({
@@ -547,7 +550,10 @@ def update_feed_url(request, retailer_id):
 @permission_classes([IsAuthenticated])
 def refresh_feed(request, retailer_id):
     import urllib.request
+    import time as _time
     from django.utils import timezone
+
+    _start = _time.time()
 
     try:
         retailer = Retailer.objects.get(id=retailer_id)
@@ -633,7 +639,8 @@ def refresh_feed(request, retailer_id):
         retailer_name=retailer.name, filename=retailer.feed_url,
         loaded=loaded, skipped=skipped, total_found=total_found,
         status='success', error_message=', '.join(errors[:3]),
-        uploaded_by=request.user.username
+        uploaded_by=request.user.username,
+        duration_seconds=round(_time.time() - _start, 2)
     )
 
     return Response({
@@ -1570,4 +1577,157 @@ def qa_price_changes(request):
         'page': page,
         'page_size': page_size,
         'total_pages': max(1, (total + page_size - 1) // page_size),
+    })
+
+
+# ─────────────────────────────────────────────
+# Scrape Health Dashboard
+# ─────────────────────────────────────────────
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def scrape_health(request):
+    from django.db.models import Avg, Count, Min, Max, Q
+    from django.utils import timezone
+    import datetime
+
+    days     = int(request.GET.get('days', 30))
+    since    = timezone.now() - datetime.timedelta(days=days)
+
+    # All upload logs in window
+    logs_qs  = UploadLog.objects.filter(created_at__gte=since).order_by('retailer_name', 'created_at')
+
+    # Group logs by retailer
+    from collections import defaultdict
+    retailer_logs = defaultdict(list)
+    for log in logs_qs.values(
+        'id', 'retailer_name', 'loaded', 'skipped', 'total_found',
+        'status', 'error_message', 'created_at', 'duration_seconds'
+    ):
+        retailer_logs[log['retailer_name']].append(log)
+
+    retailers_health = []
+    all_alerts       = []
+
+    for retailer_name, logs in retailer_logs.items():
+        total_runs    = len(logs)
+        failed_runs   = sum(1 for l in logs if l['status'] == 'failed')
+        success_runs  = total_runs - failed_runs
+        success_rate  = round(success_runs / total_runs * 100, 1) if total_runs else 0
+
+        # Duration stats (only runs that have it)
+        durations = [l['duration_seconds'] for l in logs if l['duration_seconds'] is not None]
+        avg_dur   = round(sum(durations) / len(durations), 1) if durations else None
+        max_dur   = round(max(durations), 1) if durations else None
+
+        # Last run info
+        last_log  = logs[-1]
+        last_run  = str(last_log['created_at'])[:19]
+
+        # Product count trend — last 10 runs
+        trend     = [{'date': str(l['created_at'])[:10], 'loaded': l['loaded'], 'total_found': l['total_found']} for l in logs[-10:]]
+
+        # Data quality score per run
+        # Quality = loaded / total_found % (how much we successfully parsed)
+        # NOTE: skipped includes BOTH duplicate SKUs (normal) and parse errors.
+        # We show the score for info only — not used for alerting.
+        quality_scores = []
+        for l in logs[-10:]:
+            if l['total_found'] and l['total_found'] > 0:
+                score = round(l['loaded'] / l['total_found'] * 100, 1)
+            else:
+                score = 0
+            quality_scores.append({
+                'date':        str(l['created_at'])[:10],
+                'score':       score,
+                'loaded':      l['loaded'],
+                'skipped':     l['skipped'],
+                'total_found': l['total_found'],
+                'status':      l['status'],
+            })
+
+        # ── Auto-alerts ────────────────────────────────
+        alerts = []
+
+        # 1. total_found dropped 50%+ vs previous run
+        # Use total_found (products in the XML feed), NOT loaded (which drops
+        # naturally when products already exist in DB from previous runs).
+        found_counts = [l['total_found'] for l in logs if l['status'] != 'failed' and l['total_found']]
+        if len(found_counts) >= 2:
+            prev   = found_counts[-2]
+            latest = found_counts[-1]
+            if prev > 0:
+                drop_pct = (prev - latest) / prev * 100
+                if drop_pct >= 50:
+                    alerts.append({
+                        'type':    'critical',
+                        'icon':    '📉',
+                        'message': f'Feed size dropped {round(drop_pct)}% ({prev} → {latest} products in XML)',
+                        'detail':  'Possible scraper block, site structure change, or feed truncated',
+                    })
+
+        # 2. 3 consecutive failures
+        last_3 = [l['status'] for l in logs[-3:]]
+        if len(last_3) == 3 and all(s == 'failed' for s in last_3):
+            alerts.append({
+                'type':    'critical',
+                'icon':    '❌',
+                'message': '3 consecutive scrape failures',
+                'detail':  last_log.get('error_message', '') or 'Check feed URL or site availability',
+            })
+
+        # 3. Zero products found in feed (not zero loaded — that's normal for refresh)
+        if last_log['status'] != 'failed' and last_log['total_found'] == 0:
+            alerts.append({
+                'type':    'high',
+                'icon':    '⚠️',
+                'message': 'Last scrape found 0 products in feed',
+                'detail':  'Feed may be empty or XML structure changed',
+            })
+
+        # Overall health status
+        if any(a['type'] == 'critical' for a in alerts):
+            health = 'critical'
+        elif any(a['type'] == 'high' for a in alerts):
+            health = 'warning'
+        elif alerts:
+            health = 'watch'
+        else:
+            health = 'healthy'
+
+        for a in alerts:
+            all_alerts.append({ **a, 'retailer': retailer_name, 'detected_at': last_run })
+
+        retailers_health.append({
+            'retailer':       retailer_name,
+            'health':         health,
+            'total_runs':     total_runs,
+            'success_rate':   success_rate,
+            'failed_runs':    failed_runs,
+            'last_run':       last_run,
+            'last_status':    last_log['status'],
+            'last_loaded':    last_log['loaded'],
+            'last_skipped':   last_log['skipped'],
+            'last_total':     last_log['total_found'],
+            'avg_duration':   avg_dur,
+            'max_duration':   max_dur,
+            'trend':          trend,
+            'quality_scores': quality_scores,
+            'alert_count':    len(alerts),
+            'alerts':         alerts,
+        })
+
+    # Sort: critical first, then warning, then healthy
+    order = {'critical': 0, 'warning': 1, 'watch': 2, 'healthy': 3}
+    retailers_health.sort(key=lambda x: order.get(x['health'], 9))
+
+    # Sort alerts: critical first
+    all_alerts.sort(key=lambda x: {'critical': 0, 'high': 1, 'medium': 2}.get(x['type'], 3))
+
+    return Response({
+        'retailers':     retailers_health,
+        'all_alerts':    all_alerts,
+        'total_alerts':  len(all_alerts),
+        'critical_count': sum(1 for a in all_alerts if a['type'] == 'critical'),
+        'days':          days,
     })

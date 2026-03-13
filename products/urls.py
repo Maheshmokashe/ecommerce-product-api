@@ -7,7 +7,7 @@ from .views import (
     qa_data_quality, qa_validate_feed,
     qa_fix_suggestions, qa_advanced_rules,
     qa_retailer_comparison, qa_upload_flags,
-    qa_price_changes,
+    qa_price_changes, scrape_health,
 )
 
 router = DefaultRouter()
@@ -33,4 +33,5 @@ urlpatterns = [
     path('qa/retailer-comparison/', qa_retailer_comparison),
     path('qa/upload-flags/',        qa_upload_flags),
     path('qa/price-changes/',       qa_price_changes),
+    path('scrape-health/',          scrape_health),
 ]
